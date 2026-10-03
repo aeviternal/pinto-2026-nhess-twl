@@ -490,7 +490,8 @@ save_gg(p_year_month,
 
 
 # TWL Time Series with Logistic sigmoid curve
-```{r}
+```{r, eval=FALSE}
+# Superseded by the Options A/B chunk below, which also draws the onset threshold.
 # Figure: One MOP time series + right panel logistic (D0044) using TWO predictors
 mop_id <- "D0044"
 
@@ -779,6 +780,8 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
   fit <- fit_logit_threshold(df_mop, predictor_var)
   mod <- fit$model
   thr <- fit$threshold
+  # Onset threshold: fitted probability equals the overall photo frequency
+  onset <- thr + qlogis(mean(df_mop$photo)) / fit$slope
 
   twl_seq <- seq(
     min(df_mop[[predictor_var]], na.rm = TRUE),
@@ -812,10 +815,11 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
 
   # ---- Legend setup ----
   legend_levels <- c("Evidence of impact", predictor_label,
-                     "0.5 probability threshold", "Logistic sigmoid curve")
-  color_values    <- setNames(c("red", "grey40", "forestgreen", "blue"), legend_levels)
-  linetype_values <- setNames(c("blank", "solid", "dashed", "dashed"), legend_levels)
-  shape_values    <- setNames(c(1, NA, NA, NA), legend_levels)
+                     "50% documentation threshold", "Onset threshold",
+                     "Logistic sigmoid curve")
+  color_values    <- setNames(c("red", "grey40", "forestgreen", "darkorange", "blue"), legend_levels)
+  linetype_values <- setNames(c("blank", "solid", "dashed", "longdash", "dashed"), legend_levels)
+  shape_values    <- setNames(c(1, NA, NA, NA, NA), legend_levels)
 
   # ---- Left panel ----
   p_left <- ggplot(df_plot, aes(x = date)) +
@@ -836,8 +840,12 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
       linewidth = 0.7, alpha = 0
     ) +
     geom_hline(
-      aes(yintercept = thr, color = "0.5 probability threshold",
-          linetype = "0.5 probability threshold"),
+      aes(yintercept = thr, color = "50% documentation threshold",
+          linetype = "50% documentation threshold"),
+      linewidth = 0.7, alpha = 0
+    ) +
+    geom_hline(
+      aes(yintercept = onset, color = "Onset threshold", linetype = "Onset threshold"),
       linewidth = 0.7, alpha = 0
     ) +
     scale_x_date(limits = x_lims, date_labels = date_labels,
@@ -851,9 +859,9 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
       color = guide_legend(
         ncol = 1,
         override.aes = list(
-          shape     = c(1, NA, NA, NA),
-          linetype  = c("blank", "solid", "dashed", "dashed"),
-          linewidth = c(0, 0.8, 0.8, 0.8),
+          shape     = c(1, NA, NA, NA, NA),
+          linetype  = c("blank", "solid", "dashed", "longdash", "dashed"),
+          linewidth = c(0, 0.8, 0.8, 0.8, 0.8),
           alpha     = rep(1, length(legend_levels))
         )
       ),
@@ -865,7 +873,7 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
       axis.title.y = element_text(size = 12, margin = margin(r = 10)),
       panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
       panel.grid = element_blank(),
-      legend.position = c(0.5, 0.95),
+      legend.position = c(0.5, 0.99),
       legend.justification = c(0.5, 1),
       legend.background = element_rect(fill = scales::alpha("white", 0.75), color = NA),
       legend.key = element_rect(fill = NA, color = NA),
@@ -889,20 +897,22 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
       linetype = "dashed", linewidth = 0.7, color = "blue"
     ) +
     geom_hline(yintercept = thr, linetype = "dashed", linewidth = 0.7, color = "forestgreen") +
+    geom_hline(yintercept = onset, linetype = "longdash", linewidth = 0.7, color = "darkorange") +
     scale_x_continuous(breaks = c(0, 1), labels = c("No evidence\nof impact", "Evidence\nof impact"),
-                       limits = c(-0.5, 1.5)) +
+                       limits = c(-0.6, 1.6)) +
     scale_y_continuous(limits = y_limits, expand = c(0, 0)) +
     labs(x = NULL, y = predictor_label) +
     theme_minimal() +
     theme(
       axis.text = element_text(size = 11, color = "black"),
+      axis.text.x = element_text(size = 9, color = "black"),
       axis.title.y = element_text(size = 12, margin = margin(r = 10)),
       panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
       panel.grid = element_blank(),
       legend.position = "none"
     )
 
-  g <- gridExtra::arrangeGrob(p_left, p_right, ncol = 2, widths = c(2.5, 0.9))
+  g <- gridExtra::arrangeGrob(p_left, p_right, ncol = 2, widths = c(2.5, 1.2))
 
   out_path <- here::here(params$figures_dir, paste0(file_stub, suffix, ".png"))
   ggsave(out_path, plot = g, width = fig_width, height = 6, units = "in", dpi = 300)
@@ -1983,6 +1993,16 @@ thr_f12 <- df_f12 %>%
   ) %>%
   filter(!is.na(threshold))
 
+# Onset threshold per transect (fitted probability = overall photo frequency)
+onset_f12 <- df_f12 %>%
+  group_by(mop, mop_short) %>%
+  group_modify(~ {
+    f <- fit_logit_threshold(.x, pname)
+    tibble(onset = f$threshold + qlogis(mean(.x$photo)) / f$slope)
+  }) %>%
+  ungroup() %>%
+  filter(!is.na(onset))
+
 f12_check <- thr_f12 %>%
   left_join(results_main %>% filter(predictor == pname) %>% select(mop, threshold),
             by = "mop", suffix = c("_f12", "_f10")) %>%
@@ -2012,6 +2032,14 @@ p_f12 <- ggplot(df_f12, aes(x = .data[[pname]], fill = factor(photo))) +
     aes(xintercept = threshold),
     color = "black",
     linetype = "dashed",
+    linewidth = 0.6,
+    inherit.aes = FALSE
+  ) +
+  geom_vline(
+    data = onset_f12,
+    aes(xintercept = onset),
+    color = "darkorange",
+    linetype = "longdash",
     linewidth = 0.6,
     inherit.aes = FALSE
   ) +
@@ -2468,60 +2496,78 @@ twl_enso_photos <- twl_enso %>%
 ```
 
 ```{r, eval=has_oni}
-# -----------------------------
-# f14: D0044 time series with ENSO stripe (2000–2023)
-# -----------------------------
-df_f14 <- twl_enso_photos %>%
-  filter(mop == "D0044") %>%
-  filter(date >= as.Date("2000-01-01"), date <= as.Date("2023-12-31"))
+# ---------------------------------------------------------------------------
+# Shared: which variable can be plotted on the 2000+ backbone?
+# twl_daytime from the photo panel only exists from 2015, so use the headline
+# predictor only if the backbone itself carries it; otherwise fall back to twl.
+# ---------------------------------------------------------------------------
+enso_var <- if (hp %in% names(twl_23)) hp else "twl"
+enso_label <- unname(predictor_labels[enso_var])
+if (enso_var != hp) {
+  message("ENSO figures use '", enso_var, "': backbone has no '", hp, "' column.")
+}
 
+# ---------------------------------------------------------------------------
+# f14: D0044 time series with ENSO stripe, full record
+# Changes: end date from the data (keeps 2024 photos); y-limits from the data
+# with the stripe drawn above the highest peak; gap diagnostic printed.
+# ---------------------------------------------------------------------------
+f14_mop <- "D0044"
+
+df_f14 <- twl_enso_photos %>%
+  filter(mop == f14_mop, date >= as.Date("2000-01-01")) %>%
+  filter(!is.na(.data[[enso_var]])) %>%
+  arrange(date)
 stopifnot(nrow(df_f14) > 0)
 
-y_lims_f14 <- c(0.5, 4.2)  # keep your manuscript range
-stripe_y0  <- y_lims_f14[2] - 0.20
-stripe_y1  <- y_lims_f14[2]
+# Diagnostic: runs of missing days longer than 30 days (e.g. the 2007 gap)
+df_f14 %>%
+  mutate(gap_days = as.integer(date - lag(date)) - 1L,
+         gap_start = lag(date) + 1, gap_end = date - 1) %>%
+  filter(!is.na(gap_days), gap_days > 30) %>%
+  select(gap_start, gap_end, gap_days) %>%
+  print()
+
+x_lims_f14 <- c(as.Date("2000-01-01"), max(df_f14$date))
+y_data_max <- max(df_f14[[enso_var]], na.rm = TRUE)
+y_data_min <- min(df_f14[[enso_var]], na.rm = TRUE)
+stripe_y0 <- ceiling((y_data_max + 0.05) * 10) / 10   # just above the highest peak
+stripe_y1 <- stripe_y0 + 0.20
+y_lims_f14 <- c(floor(y_data_min * 2) / 2, stripe_y1)
+
+# Stripe drawn from the ENSO calendar, so it is continuous across TWL gaps
+stripe_f14 <- oni_daily %>%
+  filter(Date >= x_lims_f14[1], Date <= x_lims_f14[2], !is.na(enso_phase))
 
 p_f14 <- ggplot(df_f14) +
-  # ENSO stripe at top
   geom_segment(
-    aes(x = date, xend = date, y = stripe_y0, yend = stripe_y1, color = enso_phase),
+    data = stripe_f14,
+    aes(x = Date, xend = Date, y = stripe_y0, yend = stripe_y1, color = enso_phase),
     linewidth = 1
   ) +
-  # TWL line
-  geom_line(aes(x = date, y = twl), color = "lightblue", linewidth = 1) +
-  # Photo markers
+  # Line drawn from the unfiltered series so it breaks across missing stretches
+  geom_line(
+    data = twl_enso_photos %>% filter(mop == f14_mop, date >= as.Date("2000-01-01")),
+    aes(x = date, y = .data[[enso_var]]), color = "lightblue", linewidth = 1
+  ) +
   geom_point(
     data = df_f14 %>% filter(photo == 1),
-    aes(x = date, y = twl),
-    color = "black",
-    size = 2.5,
-    shape = 1,
-    stroke = 1
+    aes(x = date, y = .data[[enso_var]]),
+    color = "black", size = 2.5, shape = 1, stroke = 1
   ) +
-  # Year gridlines
   geom_vline(
-    xintercept = as.numeric(seq(as.Date("2000-01-01"), as.Date("2023-12-31"), by = "1 year")),
-    color = "darkgray",
-    linetype = "dashed",
-    linewidth = 0.5
+    xintercept = as.numeric(seq(x_lims_f14[1], x_lims_f14[2], by = "1 year")),
+    color = "darkgray", linetype = "dashed", linewidth = 0.5
   ) +
-  scale_x_date(
-    date_labels = "%Y",
-    date_breaks = "1 year",
-    limits = as.Date(c("2000-01-01", "2023-12-31")),
-    expand = c(0, 0)
-  ) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year",
+               limits = x_lims_f14, expand = c(0, 0)) +
   scale_y_continuous(limits = y_lims_f14, expand = c(0, 0)) +
   scale_color_manual(
     values = c("El Niño" = "red", "La Niña" = "blue", "Neutral" = "gray"),
     breaks = c("El Niño", "La Niña", "Neutral"),
     guide = guide_legend(override.aes = list(linewidth = 3))
   ) +
-  labs(
-    x = NULL,
-    y = "MOP Transect D0044 TWL (m)",
-    color = NULL
-  ) +
+  labs(x = NULL, y = paste("MOP Transect", f14_mop, enso_label), color = NULL) +
   theme_minimal() +
   theme(
     axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5, size = 10),
@@ -2531,79 +2577,73 @@ p_f14 <- ggplot(df_f14) +
     panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
     panel.grid = element_blank()
   )
-
 p_f14
 save_gg(p_f14, "f14.png", width = 10, height = 6, dpi = 300)
 ```
 
 ```{r, eval=has_oni}
-# -----------------------------
-# f15: Extreme-event frequency by ENSO phase (selected MOPs)
-# -----------------------------
-selected_mops <- c(
-  "D0038","D0039","D0041","D0042","D0043","D0044","D0045","D0048",
-  "D0055","D0056","D0057","D0111","D0114","D0349","D0350","D0352",
-  "D0353","D0363","D0373","D0374","D0377","D0379","D0386","D0397",
-  "D0495","D0498","D0499","D0501","D0502","D0503","D0504","D0505",
-  "D0513","D0587","D0588","D0590","D0621","D0623","D0666","D0667",
-  "D0674","D0675","D0678","D0681","D0800","D0881","D0894",
-  "D0896","D0906","D1022"
-)
-
-extreme_var <- "twl"   # change to "twl" if you want "twl_max_daytime"
-twl_thr <- params$twl_threshold_for_summary
+# ---------------------------------------------------------------------------
+# f15: exceedance frequency by ENSO phase, transect-specific thresholds
+# Changes: each transect is compared with its own P = 0.5 logistic threshold
+# (main sample, 20 transects) instead of a fixed 3.4 m; counts are printed and
+# saved because exceedances of a P = 0.5 threshold are rare.
+# ---------------------------------------------------------------------------
+thr_f15 <- results_main %>%
+  filter(predictor == enso_var, fit_flag == "ok", !is.na(threshold)) %>%
+  select(mop, threshold)
+stopifnot(nrow(thr_f15) > 0, !any(duplicated(thr_f15$mop)))
 
 df_f15 <- twl_enso_photos %>%
-  filter(mop %in% selected_mops) %>%
-  filter(!is.na(.data[[extreme_var]])) %>%
-  mutate(
-    enso_phase = as.character(enso_phase),
-    enso_phase = ifelse(enso_phase %in% c("Neutral", "Excluded"), "Neutral", enso_phase),
-    extreme_event = as.integer(.data[[extreme_var]] > twl_thr)
-  )
-
+  inner_join(thr_f15, by = "mop") %>%
+  filter(!is.na(.data[[enso_var]]), !is.na(enso_phase)) %>%
+  mutate(exceed = as.integer(.data[[enso_var]] > threshold))
 stopifnot(nrow(df_f15) > 0)
 
-extreme_event_by_mop_phase <- df_f15 %>%
-  group_by(mop, enso_phase) %>%
-  summarise(frequency_of_extremes = mean(extreme_event, na.rm = TRUE), .groups = "drop") %>%
+f15_tbl <- df_f15 %>%
+  group_by(mop, threshold, enso_phase) %>%
+  summarise(n_days = n(), n_exceed = sum(exceed),
+            frequency = n_exceed / n_days, .groups = "drop") %>%
   mutate(
     enso_phase = factor(enso_phase, levels = c("El Niño", "La Niña", "Neutral")),
-    mop = factor(mop, levels = selected_mops)
-  )
+    mop = factor(mop, levels = thr_f15$mop[order(mop_to_num(thr_f15$mop))])
+  ) %>%
+  arrange(mop, enso_phase)
 
-p_f15 <- ggplot(extreme_event_by_mop_phase, aes(x = mop, y = frequency_of_extremes, fill = enso_phase)) +
-  geom_col(position = "dodge") +
-  scale_y_continuous(
-    limits = c(0, 0.04),
-    expand = c(0, 0),
-    breaks = seq(0, 0.04, 0.01)
+print(f15_tbl, n = Inf)
+readr::write_csv(f15_tbl, here::here(params$tables_dir, "enso_exceedance_by_mop_phase.csv"))
+
+# Totals across the main transects: the number to quote, if any
+f15_tbl %>%
+  group_by(enso_phase) %>%
+  summarise(n_days = sum(n_days), n_exceed = sum(n_exceed),
+            frequency = n_exceed / n_days, .groups = "drop") %>%
+  print()
+
+p_f15 <- ggplot(f15_tbl, aes(x = mop, y = frequency, fill = enso_phase)) +
+  geom_col(position = position_dodge(preserve = "single")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  scale_fill_manual(
+    values = c("El Niño" = "red", "La Niña" = "blue", "Neutral" = "grey"),
+    drop = FALSE
   ) +
   labs(
     x = "MOP Transect",
-    y = paste0("Frequency of Extreme Events (", extreme_var, " > ", twl_thr, " m)"),
+    y = paste0("Fraction of days above threshold (", sub(" \\(m\\)$", "", enso_label), ")"),
     fill = NULL
   ) +
   theme_minimal() +
   theme(
     legend.title = element_blank(),
-    axis.text.x = element_text(
-      angle = 90,
-      hjust = 0.5,
-      vjust = 0.5,
-      size = 10
-    ),
+    axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5, size = 10),
     axis.text.y = element_text(size = 10),
     axis.title.x = element_text(margin = margin(t = 10), size = 12),
     axis.title.y = element_text(margin = margin(r = 10), size = 12),
     panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
     panel.grid = element_blank(),
-    legend.position = c(0.02, 0.98),
-    legend.justification = c(0, 1),
+    legend.position = c(0.98, 0.98),
+    legend.justification = c(1, 1),
     legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5)
-  ) +
-  scale_fill_manual(values = c("El Niño" = "red", "La Niña" = "blue", "Neutral" = "grey"))
-
+  )
 p_f15
 save_gg(p_f15, "f15.png", width = 10, height = 6, dpi = 300)
 ```
@@ -2657,6 +2697,106 @@ delta_aic %>% filter(mop %in% multi_mops, predictor != baseline) %>%
   group_by(predictor) %>%
   summarise(n_pos = sum(dAIC > 0), n = n(),
             p_sign = binom.test(n_pos, n)$p.value)
+```
+
+
+# Bayesian prior sensitivity: Normal(0, 1.5)
+
+```{r bayes-prior-sensitivity}
+# Refit every transect model with tighter priors and compare thresholds with the
+# main Normal(0, 2.5) results. Compiled once, then reused.
+priors_tight <- c(
+  prior(normal(0, 1.5), class = "Intercept"),
+  prior(normal(0, 1.5), class = "b")
+)
+base_fit_tight <- brm(
+  formula = photo ~ x_centered, data = example_data,
+  family = bernoulli(link = "logit"), prior = priors_tight,
+  chains = 2, iter = 1000, warmup = 500, seed = 123, refresh = 0
+)
+bayes_tight <- purrr::map_dfr(mops_keep, function(m) {
+  d_m <- df_bayes %>% filter(mop == m, !is.na(photo), !is.na(x_centered))
+  if (nrow(d_m) < 10 || n_distinct(d_m$photo) < 2) return(tibble())
+  fit_m <- update(base_fit_tight, newdata = d_m, recompile = FALSE,
+                  chains = 4, iter = 2000, warmup = 1000, seed = 123, refresh = 0,
+                  control = list(adapt_delta = 0.95, max_treedepth = 12))
+  qs <- quantile(threshold_draws_from_fit(fit_m, params$twl_threshold_for_summary),
+                 probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+  tibble(mop = m, median_tight = qs[[2]], lower_tight = qs[[1]], upper_tight = qs[[3]])
+})
+prior_cmp <- bayes_results %>%
+  mutate(mop = as.character(mop)) %>%
+  select(mop, n_flood_photos, median_main = threshold_median,
+         lower_main = threshold_lower, upper_main = threshold_upper) %>%
+  left_join(bayes_tight, by = "mop") %>%
+  mutate(diff_median = median_tight - median_main) %>%
+  mutate(across(where(is.double), ~ round(.x, 2)))
+old_opts <- options(width = 220)
+print(prior_cmp, n = Inf, width = Inf)
+prior_cmp %>%
+  mutate(group = if_else(n_flood_photos >= 8, "8+ photos", "2-7 photos")) %>%
+  group_by(group) %>%
+  summarise(n = n(), median_diff = median(diff_median),
+            max_abs_diff = max(abs(diff_median)), .groups = "drop") %>%
+  print(width = Inf)
+options(old_opts)
+readr::write_csv(prior_cmp, here::here(params$tables_dir, "bayes_prior_sensitivity.csv"))
+```
+
+# Numbers for the reviewer responses
+
+```{r response-numbers}
+# Printed at full width so nothing is hidden in the HTML log.
+old_opts <- options(width = 220)
+
+# 1. Headline-predictor thresholds with delta-method intervals
+results_main %>%
+  filter(predictor == hp) %>%
+  select(mop, total_photos, n_events, threshold, lower_95, upper_95, slope, p_value) %>%
+  print(n = Inf, width = Inf)
+
+# 2. Onset thresholds: the predictor value at which the fitted probability equals
+#    the transect's overall photo frequency (crossing point of the photo and
+#    no-photo distributions; equal class weights). Delta-method interval, taking
+#    the photo frequency as fixed.
+onset_tbl <- purrr::map_dfr(mops_main, function(m) {
+  d   <- df_photos_max %>% filter(mop == m, !is.na(.data[[hp]]), !is.na(photo))
+  mod <- glm(as.formula(paste("photo ~", hp)), data = d, family = binomial)
+  b   <- unname(coef(mod)); V <- vcov(mod)
+  k   <- qlogis(mean(d$photo))
+  onset <- (k - b[1]) / b[2]
+  g   <- c(-1 / b[2], -(k - b[1]) / b[2]^2)
+  se  <- sqrt(as.numeric(t(g) %*% V %*% g))
+  thr50 <- -b[1] / b[2]
+  x1  <- d[[hp]][d$photo == 1]
+  tibble(mop = m, n_photos = sum(d$photo), n_days = nrow(d),
+         photo_rate = mean(d$photo),
+         threshold_50 = thr50,
+         onset = onset, onset_lower = onset - 1.96 * se, onset_upper = onset + 1.96 * se,
+         photos_above_onset = sum(x1 > onset), photos_above_50 = sum(x1 > thr50))
+}) %>%
+  mutate(across(c(threshold_50, onset, onset_lower, onset_upper), ~ round(.x, 2)),
+         photo_rate = signif(photo_rate, 3))
+print(onset_tbl, n = Inf, width = Inf)
+onset_tbl %>%
+  summarise(median_onset = median(onset), min_onset = min(onset), max_onset = max(onset),
+            median_50 = median(threshold_50),
+            photos = sum(n_photos), above_onset = sum(photos_above_onset),
+            above_50 = sum(photos_above_50)) %>%
+  print(width = Inf)
+readr::write_csv(onset_tbl, here::here(params$tables_dir, "onset_thresholds_by_mop.csv"))
+
+# 3. Delta versus Fieller intervals, all columns
+if (exists("cmp")) print(cmp %>% mutate(across(where(is.numeric), ~ round(.x, 3))), n = Inf, width = Inf)
+
+# 4. AR GLMM odds ratios behind Fig. 12
+if (exists("ar_glmm_results")) print(ar_glmm_results, n = Inf, width = Inf)
+
+# 5. Photo transect-days that could not be matched to the panel
+unmatched_path <- here::here("output", "photos_unmatched.csv")
+if (file.exists(unmatched_path)) print(readr::read_csv(unmatched_path, show_col_types = FALSE), n = Inf, width = Inf)
+
+options(old_opts)
 ```
 
 
