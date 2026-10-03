@@ -516,7 +516,7 @@ y_min <- suppressWarnings(min(c(df_mop_all[[hp]], df_mop_all$twl), na.rm = TRUE)
 y_max <- suppressWarnings(max(c(df_mop_all[[hp]], df_mop_all$twl), na.rm = TRUE))
 
 if (!is.finite(y_min) || !is.finite(y_max)) {
-  stop("Could not compute shared y-limits for ", mop_id, ". Check that twl and/or twl_max_daytime exist and are numeric.")
+  stop("Could not compute shared y-limits for ", mop_id, ". Check that twl and the headline predictor exist and are numeric.")
 }
 y_limits <- c(y_min, y_max + y_max_pad)
 
@@ -1255,7 +1255,7 @@ save_gg(p_ci, "f10.png", width = 10, height = 6)
 ```{r}
 # ============================================================
 # Fieller vs delta-method 95% intervals for the P = 0.5 threshold
-# Predictor: TWL-max-daytime (same as Figure 9)
+# Predictor: headline predictor (same as Figure 9)
 # ============================================================
 
 # Fieller interval for theta = -b0/b1 from a fitted binomial GLM.
@@ -1528,7 +1528,7 @@ summary_main_sig
 # ============================================================
 # Bayesian Analysis: Transect-specific TWL thresholds (P=0.5)
 # Outcome: photo (0/1)
-# Predictor: TWL-max-daytime (centered at params$twl_threshold_for_summary)
+# Predictor: headline predictor (centered at params$twl_threshold_for_summary)
 # ============================================================
 
 
@@ -2497,15 +2497,11 @@ twl_enso_photos <- twl_enso %>%
 
 ```{r, eval=has_oni}
 # ---------------------------------------------------------------------------
-# Shared: which variable can be plotted on the 2000+ backbone?
-# twl_daytime from the photo panel only exists from 2015, so use the headline
-# predictor only if the backbone itself carries it; otherwise fall back to twl.
+# Shared settings for the ENSO figures
 # ---------------------------------------------------------------------------
-enso_var <- if (hp %in% names(twl_23)) hp else "twl"
+# ENSO figures use the daily (24-hour) maximum TWL, as in the submitted manuscript.
+enso_var <- "twl"
 enso_label <- unname(predictor_labels[enso_var])
-if (enso_var != hp) {
-  message("ENSO figures use '", enso_var, "': backbone has no '", hp, "' column.")
-}
 
 # ---------------------------------------------------------------------------
 # f14: D0044 time series with ENSO stripe, full record
@@ -2582,68 +2578,74 @@ save_gg(p_f14, "f14.png", width = 10, height = 6, dpi = 300)
 ```
 
 ```{r, eval=has_oni}
-# ---------------------------------------------------------------------------
-# f15: exceedance frequency by ENSO phase, transect-specific thresholds
-# Changes: each transect is compared with its own P = 0.5 logistic threshold
-# (main sample, 20 transects) instead of a fixed 3.4 m; counts are printed and
-# saved because exceedances of a P = 0.5 threshold are rare.
-# ---------------------------------------------------------------------------
-thr_f15 <- results_main %>%
-  filter(predictor == enso_var, fit_flag == "ok", !is.na(threshold)) %>%
-  select(mop, threshold)
-stopifnot(nrow(thr_f15) > 0, !any(duplicated(thr_f15$mop)))
+# As in the submitted manuscript: days above a fixed TWL value, all photo transects.
+# -----------------------------
+# f15: Extreme-event frequency by ENSO phase (selected MOPs)
+# -----------------------------
+selected_mops <- c(
+  "D0038","D0039","D0041","D0042","D0043","D0044","D0045","D0048",
+  "D0055","D0056","D0057","D0111","D0114","D0349","D0350","D0352",
+  "D0353","D0363","D0373","D0374","D0377","D0379","D0386","D0397",
+  "D0495","D0498","D0499","D0501","D0502","D0503","D0504","D0505",
+  "D0513","D0587","D0588","D0590","D0621","D0623","D0666","D0667",
+  "D0674","D0675","D0678","D0681","D0800","D0881","D0894",
+  "D0896","D0906","D1022"
+)
+
+extreme_var <- "twl"   # daily (24-hour) maximum TWL
+twl_thr <- params$twl_threshold_for_summary
 
 df_f15 <- twl_enso_photos %>%
-  inner_join(thr_f15, by = "mop") %>%
-  filter(!is.na(.data[[enso_var]]), !is.na(enso_phase)) %>%
-  mutate(exceed = as.integer(.data[[enso_var]] > threshold))
+  filter(mop %in% selected_mops) %>%
+  filter(!is.na(.data[[extreme_var]])) %>%
+  mutate(
+    enso_phase = as.character(enso_phase),
+    enso_phase = ifelse(enso_phase %in% c("Neutral", "Excluded"), "Neutral", enso_phase),
+    extreme_event = as.integer(.data[[extreme_var]] > twl_thr)
+  )
+
 stopifnot(nrow(df_f15) > 0)
 
-f15_tbl <- df_f15 %>%
-  group_by(mop, threshold, enso_phase) %>%
-  summarise(n_days = n(), n_exceed = sum(exceed),
-            frequency = n_exceed / n_days, .groups = "drop") %>%
+extreme_event_by_mop_phase <- df_f15 %>%
+  group_by(mop, enso_phase) %>%
+  summarise(frequency_of_extremes = mean(extreme_event, na.rm = TRUE), .groups = "drop") %>%
   mutate(
     enso_phase = factor(enso_phase, levels = c("El Niño", "La Niña", "Neutral")),
-    mop = factor(mop, levels = thr_f15$mop[order(mop_to_num(thr_f15$mop))])
-  ) %>%
-  arrange(mop, enso_phase)
+    mop = factor(mop, levels = selected_mops)
+  )
 
-print(f15_tbl, n = Inf)
-readr::write_csv(f15_tbl, here::here(params$tables_dir, "enso_exceedance_by_mop_phase.csv"))
-
-# Totals across the main transects: the number to quote, if any
-f15_tbl %>%
-  group_by(enso_phase) %>%
-  summarise(n_days = sum(n_days), n_exceed = sum(n_exceed),
-            frequency = n_exceed / n_days, .groups = "drop") %>%
-  print()
-
-p_f15 <- ggplot(f15_tbl, aes(x = mop, y = frequency, fill = enso_phase)) +
-  geom_col(position = position_dodge(preserve = "single")) +
-  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
-  scale_fill_manual(
-    values = c("El Niño" = "red", "La Niña" = "blue", "Neutral" = "grey"),
-    drop = FALSE
+p_f15 <- ggplot(extreme_event_by_mop_phase, aes(x = mop, y = frequency_of_extremes, fill = enso_phase)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(
+    limits = c(0, 0.04),
+    expand = c(0, 0),
+    breaks = seq(0, 0.04, 0.01)
   ) +
   labs(
     x = "MOP Transect",
-    y = paste0("Fraction of days above threshold (", sub(" \\(m\\)$", "", enso_label), ")"),
+    y = paste0("Frequency of extreme TWL (daily maximum > ", twl_thr, " m)"),
     fill = NULL
   ) +
   theme_minimal() +
   theme(
     legend.title = element_blank(),
-    axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5, size = 10),
+    axis.text.x = element_text(
+      angle = 90,
+      hjust = 0.5,
+      vjust = 0.5,
+      size = 10
+    ),
     axis.text.y = element_text(size = 10),
     axis.title.x = element_text(margin = margin(t = 10), size = 12),
     axis.title.y = element_text(margin = margin(r = 10), size = 12),
     panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
     panel.grid = element_blank(),
-    legend.position = c(0.98, 0.98),
-    legend.justification = c(1, 1),
+    legend.position = c(0.02, 0.98),
+    legend.justification = c(0, 1),
     legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5)
-  )
+  ) +
+  scale_fill_manual(values = c("El Niño" = "red", "La Niña" = "blue", "Neutral" = "grey"))
+
 p_f15
 save_gg(p_f15, "f15.png", width = 10, height = 6, dpi = 300)
 ```
