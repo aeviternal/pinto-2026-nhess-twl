@@ -1,0 +1,2666 @@
+---
+title: "Pinto et al. (NHESS): total water level and photo evidence of coastal flooding"
+author: "Tom Corringham and Denali Pinto"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+params:
+  dev_mode: false
+  data_dir: "data"
+  figures_dir: "output/figures"
+  tables_dir: "output/tables"
+  transects_rds: "output/twl_backbone.rds"
+  twl_photos_rds: "output/twl_photo_panel.rds"
+  headline_predictor: "twl_daytime"
+  mop_transects_txt: "CA_v1.1_transect_definitions_SD_County.txt"
+  mop_txt_skip: 30
+  ib_mop_min: "D0037"
+  ib_mop_max: "D0057"
+  time_xlim_start: "2018-11-01"
+  time_xlim_end: "2021-02-28"
+  twl_threshold_for_summary: 3.4
+  exclude_mops_min_photos_for_threshold_plots: 2
+  ar_catalog_xlsx: "ARcatalog_NCEP_NEW_1948-2023_COMPREHENSIVE_08-07-2023_Ranked_Daily_32.5.xlsx"
+  ar_catalog_sheet: 1
+  ar_window_max_lag_days: 7
+  oni_nc: "oni.nc"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.retina = 2
+)
+
+# ---- Reproducibility ----
+set.seed(123)
+
+# ---- Reproducibility ----
+options(mc.cores = 1, brms.backend = "cmdstanr")
+Sys.setenv(
+  TZ = "UTC",
+  OMP_NUM_THREADS = "1",
+  MKL_NUM_THREADS = "1",
+  OPENBLAS_NUM_THREADS = "1"
+)
+
+```
+
+Constants
+```{r constants}
+exclude_mops_default <- c("D0841")
+
+# Headline predictor for threshold figures, Fieller intervals and Bayesian fits.
+hp <- params$headline_predictor
+predictor_labels <- c(
+  twl = "TWL (m)", runup = "Runup (m)",
+  twl_daytime = "TWL-daytime (m)", runup_daytime = "Runup-daytime (m)",
+  twl_max = "TWL-max (m)", twl_max_daytime = "TWL-max-daytime (m)")
+hp_label <- unname(predictor_labels[hp])
+hp_name  <- sub(" \\(m\\)$", "", hp_label)
+stopifnot(!is.na(hp_label))
+
+# Optional inputs: sections are skipped when the file is absent.
+has_ar  <- file.exists(here::here(params$data_dir, params$ar_catalog_xlsx))
+has_oni <- file.exists(here::here(params$data_dir, params$oni_nc))
+if (!has_ar)  message("AR catalog not found: atmospheric river section skipped.")
+if (!has_oni) message("ONI file not found: ENSO section skipped.")
+min_photos_keep_default <- params$exclude_mops_min_photos_for_threshold_plots
+```
+
+
+### Packages
+```{r packages}
+# ---- Packages ----
+suppressPackageStartupMessages({
+  library(tidyverse)   # dplyr, ggplot2, tidyr, readr, purrr, stringr, tibble
+  library(lubridate)
+  library(here)
+  library(broom)
+  library(gridExtra)
+  library(viridis)
+  library(DT)
+  library(readxl)
+  library(lme4)
+  library(ggtext)
+  library(ncdf4)
+  library(posterior)
+  library(brms)
+  library(grid)        # for unit()/arrow() in f11
+})
+
+# ---- Fail fast if ggtext missing (optional since we load it above) ----
+if (!requireNamespace("ggtext", quietly = TRUE)) {
+  stop(
+    "Package 'ggtext' is required but not installed.\n",
+    "Install it before knitting:\n",
+    "install.packages('ggtext')"
+  )
+}
+
+# Create output folders
+dir.create(here::here(params$figures_dir), recursive = TRUE, showWarnings = FALSE)
+dir.create(here::here(params$tables_dir),  recursive = TRUE, showWarnings = FALSE)
+```
+
+### Helpers
+```{r}
+
+assert_file_exists <- function(path) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  invisible(TRUE)
+}
+
+# -----------------------------
+# Helper: region from MOP ID
+# -----------------------------
+mop_region <- function(mop) {
+  case_when(
+    mop >= "D0038" & mop <= "D0057" ~ "Imperial Beach",
+    mop >= "D0495" & mop <= "D0513" ~ "La Jolla",
+    mop %in% c("D0666", "D0667")    ~ "Cardiff State Beach",
+    TRUE                           ~ "Other"
+  )
+}
+
+# -----------------------------
+# Photo-count bins (drives point/errorbar color + legend)
+# -----------------------------
+photo_bin <- function(n) {
+  case_when(
+    n == 1                    ~ "1",
+    n >= 2  & n <= 7          ~ "2–7",
+    n >= 8  & n <= 12         ~ "8–12",
+    n >= 13 & n <= 20         ~ "13–20",
+    n >= 21 & n <= 30         ~ "21–30",
+    n >= 31 & n <= 50         ~ "31–50",
+    n > 50                    ~ "50+",
+    TRUE                      ~ NA_character_
+  )
+}
+
+region_colors <- c(
+  "Imperial Beach"      = "#1f77b4",
+  "La Jolla"            = "#ff7f0e",
+  "Cardiff State Beach" = "#2ca02c",
+  "Other"               = "black"
+)
+
+photo_colors <- c(
+  "1"     = "grey",
+  "2–7"   = "violet",
+  "8–12"  = "purple",
+  "13–20" = "blue",
+  "21–30" = "darkblue",
+  "31–50" = "darkred",
+  "50+"   = "red"
+)
+
+save_gg <- function(plot, filename, width=10, height=6, dpi=300) {
+  out <- here::here(params$figures_dir, filename)
+  ggsave(out, plot = plot, width = width, height = height, units = "in", dpi = dpi)
+  message("Saved: ", out)
+  invisible(out)
+}
+
+dedupe_mop_date_keep_photo <- function(df) {
+  # Ensures one row per mop-date, prioritizing photo==1 if duplicates exist.
+  df %>%
+    group_by(mop, date) %>%
+    arrange(desc(photo)) %>%
+    slice(1) %>%
+    ungroup()
+}
+
+add_twl_max_vars <- function(df) {
+  # twl_max: max(twl, twl_1_day_before), keeping non-NA if one is missing
+  # twl_max_daytime: max(twl_daytime, twl_1_day_before), keeping non-NA if one is missing
+  df %>%
+    mutate(
+      twl_max = case_when(
+        is.na(twl) ~ twl_1_day_before,
+        is.na(twl_1_day_before) ~ twl,
+        TRUE ~ pmax(twl, twl_1_day_before, na.rm = TRUE)
+      ),
+      twl_max_daytime = case_when(
+        is.na(twl_daytime) ~ twl_1_day_before,
+        is.na(twl_1_day_before) ~ twl_daytime,
+        TRUE ~ pmax(twl_daytime, twl_1_day_before, na.rm = TRUE)
+      )
+    )
+}
+
+fit_logit_threshold <- function(df, predictor, max_abs_threshold = 50, min_abs_slope = 1e-6) {
+  f   <- as.formula(paste0("photo ~ ", predictor))
+  mod <- suppressWarnings(glm(f, data = df, family = binomial))
+
+  x <- df[[predictor]]; y <- df$photo
+  separated <- min(x[y == 1]) >= max(x[y == 0]) || max(x[y == 1]) <= min(x[y == 0])
+
+  co    <- coef(mod)
+  slope <- if (length(co) >= 2) unname(co[2]) else NA_real_
+  out   <- list(model = mod, threshold = NA_real_, slope = slope,
+                converged = mod$converged, separated = separated,
+                n_events = sum(y == 1))
+
+  if (separated)      { out$flag <- "separated";      return(out) }
+  if (!mod$converged) { out$flag <- "not_converged";  return(out) }
+  if (is.na(slope) || abs(slope) < min_abs_slope) {
+    out$flag <- "slope_near_zero"; return(out)
+  }
+  thr <- unname(-co[1] / slope)
+  if (!is.finite(thr) || abs(thr) > max_abs_threshold) {
+    out$flag <- "threshold_implausible"; return(out)
+  }
+  out$threshold <- thr; out$flag <- "ok"; out
+}
+
+threshold_se_delta <- function(model) {
+  b <- coef(model)
+  V <- suppressWarnings(vcov(model))
+
+  # Need intercept + slope
+  if (length(b) < 2) return(NA_real_)
+  b0 <- b[1]; b1 <- b[2]
+
+  # Guard
+  if (any(is.na(c(b0, b1))) || !is.finite(b1) || b1 == 0) return(NA_real_)
+  if (any(is.na(V[1:2, 1:2]))) return(NA_real_)
+
+  g <- c(-1 / b1, b0 / (b1^2))
+  se <- sqrt(as.numeric(t(g) %*% V[1:2, 1:2] %*% g))
+
+  if (!is.finite(se)) return(NA_real_)
+  se
+}
+
+mop_to_num <- function(mop) as.numeric(gsub("^D", "", mop))
+```
+
+### Read inputs
+```{r}
+transects_path <- here::here(params$transects_rds)
+photos_path    <- here::here(params$twl_photos_rds)
+mop_txt_path   <- here::here(params$data_dir, params$mop_transects_txt)
+
+assert_file_exists(transects_path)
+assert_file_exists(photos_path)
+assert_file_exists(mop_txt_path)
+
+data_transects <- readRDS(transects_path)
+df_raw <- readRDS(photos_path)
+
+required_df_raw <- c("mop","date","photo","twl","twl_daytime","runup","runup_daytime",
+                     "twl_1_day_before","runup_1_day_before")
+missing <- setdiff(required_df_raw, names(df_raw))
+if (length(missing) > 0) stop("df_raw missing columns: ", paste(missing, collapse=", "))
+
+stopifnot(all(c("mop","date","twl") %in% names(data_transects)))
+
+mop_ll <- readr::read_delim(
+  mop_txt_path,
+  delim = "\t",
+  col_names = c(
+    "Sequence number",
+    "Label",
+    "Backbeach longitude",
+    "Backbeach latitude",
+    "Prediction site longitude",
+    "Prediction site latitude",
+    "Prediction site depth",
+    "Shore normal",
+    "Shore type flag"
+  ),
+  skip = params$mop_txt_skip,
+  show_col_types = FALSE
+)
+```
+```{r dev-checks, include=FALSE}
+dplyr::glimpse(df_raw)
+range(data_transects$mop, na.rm = TRUE)
+```
+
+
+## Data preparation
+```{r}
+df <- df_raw %>%
+  filter(!is.na(date), !is.na(mop)) %>%
+  mutate(date = as.Date(date)) %>%
+  filter(str_detect(mop, "^D\\d+$"))
+
+# Keep only MOPs with >=1 photo anywhere in their time series
+df_photos <- df %>%
+  group_by(mop) %>%
+  filter(any(photo == 1, na.rm = TRUE)) %>%
+  ungroup()
+
+# De-duplicate mop-date pairs (if present)
+df_photos <- dedupe_mop_date_keep_photo(df_photos)
+
+# Add max predictors
+df_photos_max <- df_photos %>%
+  add_twl_max_vars()
+
+min_events <- params$exclude_mops_min_photos_for_threshold_plots
+preds_all  <- c("twl", "runup", "twl_daytime", "runup_daytime", "twl_max", "twl_max_daytime")
+
+mop_events <- df_photos_max %>%
+  tidyr::drop_na(dplyr::all_of(c("photo", preds_all))) %>%
+  group_by(mop) %>%
+  summarise(n_events = sum(photo == 1), n_days = n(), .groups = "drop")
+
+mops_main <- mop_events %>%
+  filter(n_events >= min_events, !mop %in% exclude_mops_default) %>%
+  pull(mop)
+
+length(mops_main)
+
+# Optionally drop day-before columns for export artifacts
+df_photos_export <- df_photos_max %>%
+  select(-twl_1_day_before, -runup_1_day_before)
+```
+
+```{r}
+# Summary counts used in Table/Results text
+n_mops_all   <- dplyr::n_distinct(df$mop)
+n_mops_photo <- dplyr::n_distinct(df_photos$mop)
+n_days       <- dplyr::n_distinct(df_photos$date)
+n_photos     <- sum(df_photos$photo == 1, na.rm = TRUE)
+
+summary_tbl <- tibble(
+  n_unique_mops_raw        = n_mops_all,
+  n_unique_mops_with_photo = n_mops_photo,
+  n_unique_days            = n_days,
+  total_photos             = n_photos,
+  date_min                 = min(df_photos$date, na.rm = TRUE),
+  date_max                 = max(df_photos$date, na.rm = TRUE)
+)
+
+print(summary_tbl)
+```
+
+# Figure: Photos per MOP (with region categories)
+```{r}
+# Count photos per MOP and assign location groups
+df_mop_counts <- df_photos %>%
+  dplyr::group_by(mop) %>%
+  dplyr::summarise(total_photos = sum(photo == 1, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(
+    mop_num = mop_to_num(mop),
+    location = dplyr::case_when(
+      mop >= "D0038" & mop <= "D0057" ~ "Imperial Beach",
+      mop >= "D0495" & mop <= "D0513" ~ "La Jolla",
+      mop %in% c("D0666", "D0667")    ~ "Cardiff State Beach",
+      TRUE                            ~ "Other"
+    )
+  ) %>%
+  dplyr::arrange(mop_num) %>%
+  dplyr::mutate(mop = factor(mop, levels = mop))
+
+# Consistent manuscript palette (matches your second chunk)
+loc_colors <- c(
+  "Imperial Beach"       = "#1f77b4",
+  "La Jolla"             = "#ff7f0e",
+  "Cardiff State Beach"  = "#2ca02c",
+  "Other"                = "#4D4D4D"  
+)
+
+df_mop_counts <- df_mop_counts %>%
+  dplyr::mutate(
+    mop_label = paste0(
+      "<span style='color:", loc_colors[location], "'>",
+      as.character(mop),
+      "</span>"
+    )
+  )
+
+p_photos_per_mop <- ggplot(df_mop_counts, aes(x = mop, y = total_photos, fill = location)) +
+  geom_col(width = 0.85) +
+  scale_fill_manual(values = loc_colors, drop = FALSE) +
+  scale_x_discrete(labels = setNames(gsub("<[^>]+>", "", df_mop_counts$mop_label), df_mop_counts$mop)) +
+  labs(
+    x = "MOP Transect",
+    y = "Total Photos",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 10),
+    axis.title.x = element_text(margin = margin(t = 10), size = 12),
+    axis.title.y = element_text(margin = margin(r = 10), size = 12),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    legend.position = c(0.85, 0.95),
+    legend.justification = "top",
+    legend.margin = margin(r = 20),
+    plot.margin = margin(r = 40)
+  )
+
+p_photos_per_mop
+save_gg(p_photos_per_mop, "f07.png", width = 10, height = 6)
+```
+
+# Figure: Monthly photographed incidents
+```{r}
+df_monthly <- df_photos %>%
+  filter(photo == 1) %>%
+  mutate(month_num = lubridate::month(date)) %>%
+  count(month_num) %>%
+  mutate(
+    month = factor(month_num,
+                   levels = c(10,11,12,1,2,3,4,5,6,7,8,9),
+                   labels = c("Oct","Nov","Dec","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep"))
+  )
+
+p_monthly <- ggplot(df_monthly, aes(x = month, y = n, fill = month)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_viridis(discrete = TRUE) +
+  labs(x = NULL, y = "Number of Photographed Incidents") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 12),
+    axis.title.y = element_text(size = 14, margin = margin(r = 10)),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8)
+  )
+
+p_monthly
+save_gg(p_monthly, "f04.png", width = 10, height = 6)
+
+mean(df_monthly$n)
+var(df_monthly$n)
+```
+# Figure: Year and month of photographed incidents
+```{r}
+# ----- Year x Month photographed incidents (Oct–Sep order, viridis palette) -----
+
+data_clean <- df_photos_export  # or df_photos_max / df_photos
+
+# Ensure required columns exist
+stopifnot(all(c("date", "photo") %in% names(data_clean)))
+
+# Ensure Date format
+data_clean <- data_clean %>%
+  mutate(date = as.Date(date))
+
+# Custom month order (October–September)
+month_order <- c(
+  "October", "November", "December", "January", "February", "March",
+  "April", "May", "June", "July", "August", "September"
+)
+
+# Prepare counts
+yearly_monthly_counts <- data_clean %>%
+  mutate(
+    year  = lubridate::year(date),
+    month = lubridate::month(date, label = TRUE, abbr = FALSE),
+    month = factor(as.character(month), levels = month_order)
+  ) %>%
+  filter(photo == 1) %>%
+  count(year, month, name = "n")
+
+p_year_month <- ggplot(yearly_monthly_counts,
+                       aes(x = factor(year), y = n, fill = month)) +
+  geom_col(position = position_dodge2(preserve = "single")) +
+  scale_fill_viridis(discrete = TRUE) +   
+  labs(
+    x = NULL,
+    y = "Number of Photographed Incidents",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = -45, hjust = 0.5, vjust = 0.5, size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.y = element_text(margin = margin(r = 10), size = 14),
+    legend.text = element_text(size = 12),
+    legend.title = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+  )
+
+p_year_month
+save_gg(p_year_month,
+        "f05.png",
+        width = 10, height = 6)
+```
+
+
+# TWL Time Series with Logistic sigmoid curve
+```{r}
+# Figure: One MOP time series + right panel logistic (D0044) using TWO predictors
+mop_id <- "D0044"
+
+# Predictors used in the manuscript and their axis labels / filenames
+predictors_fig08_09 <- tribble(
+  ~predictor_var,      ~predictor_label,        ~file_stub,
+  hp,                   hp_label,                "f09",
+  "twl",                "TWL (m)",              "f08"
+)
+
+# Filter to IB + the selected MOP once
+df_ib <- df_photos_max %>%
+  filter(mop >= params$ib_mop_min, mop <= params$ib_mop_max) %>%
+  mutate(date = as.Date(date))
+
+df_mop_all <- df_ib %>% filter(mop == mop_id)
+stopifnot(nrow(df_mop_all) > 0)
+
+# ---- Shared y-axis limits across BOTH predictors (same scale) ----
+y_max_pad <- 0.5
+y_min <- suppressWarnings(min(c(df_mop_all[[hp]], df_mop_all$twl), na.rm = TRUE))
+y_max <- suppressWarnings(max(c(df_mop_all[[hp]], df_mop_all$twl), na.rm = TRUE))
+
+if (!is.finite(y_min) || !is.finite(y_max)) {
+  stop("Could not compute shared y-limits for ", mop_id, ". Check that twl and/or twl_max_daytime exist and are numeric.")
+}
+y_limits <- c(y_min, y_max + y_max_pad)
+
+# ---- Helper to build the two-panel figure for one predictor ----
+make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor_label, file_stub) {
+
+  df_mop <- df_mop_all %>%
+    filter(!is.na(.data[[predictor_var]]))
+  stopifnot(nrow(df_mop) > 0)
+
+  # Fit model: photo ~ predictor
+  fit <- fit_logit_threshold(df_mop, predictor_var)
+  mod <- fit$model
+  thr <- fit$threshold
+
+  # Build logistic curve
+  twl_seq <- seq(
+    min(df_mop[[predictor_var]], na.rm = TRUE),
+    max(df_mop[[predictor_var]], na.rm = TRUE) + 1,
+    length.out = 200
+  )
+  newdata <- tibble(!!predictor_var := twl_seq)
+
+  logistic_curve <- tibble(
+    twl  = twl_seq,
+    prob = predict(mod, newdata = newdata, type = "response")
+  )
+
+  # ---- Legend levels (exactly what you want, in order) ----
+  legend_levels <- c(
+    "Evidence of impact",
+    predictor_label,
+    "0.5 probability threshold",
+    "Logistic sigmoid curve"
+  )
+
+  # ---- Robust named scale values (always 4, always aligned) ----
+  color_values <- setNames(
+    c("red", "grey40", "forestgreen", "blue"),
+    legend_levels
+  )
+
+  linetype_values <- setNames(
+    c("blank", "solid", "dashed", "dashed"),
+    legend_levels
+  )
+
+  shape_values <- setNames(
+    c(1, NA, NA, NA),
+    legend_levels
+  )
+
+  # Override aesthetics MUST match length(legend_levels)
+  override_shapes    <- c(1, NA, NA, NA)
+  override_linetypes <- c("blank", "solid", "dashed", "dashed")
+  override_linewidth <- c(0, 0.8, 0.8, 0.8)
+
+  # Left panel: time series (legend lives HERE)
+  p_left <- ggplot(df_mop, aes(x = date)) +
+
+    # TWL line -> legend item
+    geom_line(
+      aes(
+        y = .data[[predictor_var]],
+        color = predictor_label,
+        linetype = predictor_label
+      ),
+      linewidth = 0.7
+    ) +
+
+    # Impact points (red open circles) -> legend item
+    geom_point(
+      data = df_mop %>% filter(photo == 1),
+      aes(
+        y = .data[[predictor_var]],
+        color = "Evidence of impact",
+        shape = "Evidence of impact",
+        linetype = "Evidence of impact"
+      ),
+      size = 2.6, stroke = 1
+    ) +
+
+    # Dummy logistic curve legend key (blue dashed) — invisible but appears in legend
+    geom_line(
+      data = logistic_curve,
+      aes(
+        x = df_mop$date[1], y = twl,
+        color = "Logistic sigmoid curve",
+        linetype = "Logistic sigmoid curve"
+      ),
+      linewidth = 0.7, alpha = 0
+    ) +
+
+    # Dummy threshold legend key (green dashed) — invisible but appears in legend
+    geom_hline(
+      aes(
+        yintercept = thr,
+        color = "0.5 probability threshold",
+        linetype = "0.5 probability threshold"
+      ),
+      linewidth = 0.7, alpha = 0
+    ) +
+
+    scale_x_date(
+      limits = as.Date(c(params$time_xlim_start, params$time_xlim_end)),
+      date_labels = "%b %Y",
+      date_breaks = "6 months",
+      expand = c(0, 0)
+    ) +
+    scale_y_continuous(limits = y_limits, expand = c(0, 0)) +
+    labs(x = NULL, y = predictor_label, color = NULL, linetype = NULL, shape = NULL) +
+
+    # Unified legend scales (robust)
+    scale_color_manual(values = color_values, breaks = legend_levels, drop = FALSE) +
+    scale_linetype_manual(values = linetype_values, breaks = legend_levels, drop = FALSE) +
+    scale_shape_manual(values = shape_values, breaks = legend_levels, drop = FALSE) +
+
+    guides(
+      color = guide_legend(
+        ncol = 1,
+        override.aes = list(
+          shape     = override_shapes,
+          linetype  = override_linetypes,
+          linewidth = override_linewidth,
+          alpha     = rep(1, length(legend_levels))
+        )
+      ),
+      linetype = "none",
+      shape    = "none"
+    ) +
+
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 11, color = "black"),
+      axis.title.y = element_text(size = 12, margin = margin(r = 10)),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      panel.grid = element_blank(),
+
+      # legend inside, top-center of time series
+      legend.position = c(0.5, 0.95),
+      legend.justification = c(0.5, 1),
+      legend.background = element_rect(fill = scales::alpha("white", 0.75), color = NA),
+      legend.key = element_rect(fill = NA, color = NA),
+      legend.text = element_text(size = 10)
+    )
+
+  # Right panel: 0/1 impacts + logistic curve in probability space (no legend)
+  p_right <- ggplot() +
+    geom_point(
+      data = df_mop %>% filter(photo == 0),
+      aes(x = 0, y = .data[[predictor_var]]),
+      shape = 1, size = 2.6, stroke = 1, color = "grey60"
+    ) +
+    geom_point(
+      data = df_mop %>% filter(photo == 1),
+      aes(x = 1, y = .data[[predictor_var]]),
+      shape = 1, size = 2.6, stroke = 1, color = "red"
+    ) +
+    geom_line(
+      data = logistic_curve,
+      aes(x = prob, y = twl),
+      linetype = "dashed", linewidth = 0.7, color = "blue"
+    ) +
+    geom_hline(
+      yintercept = thr,
+      linetype = "dashed", linewidth = 0.7, color = "forestgreen"
+    ) +
+    scale_x_continuous(
+      breaks = c(0, 1),
+      labels = c("No evidence\nof impact", "Evidence\nof impact"),
+      limits = c(-0.5, 1.5)
+    ) +
+    scale_y_continuous(limits = y_limits, expand = c(0, 0)) +
+    labs(x = NULL, y = predictor_label) +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 11, color = "black"),
+      axis.title.y = element_text(size = 12, margin = margin(r = 10)),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      panel.grid = element_blank(),
+      legend.position = "none"
+    )
+
+  g <- grid.arrange(p_left, p_right, ncol = 2, widths = c(2.5, 0.9))
+
+  # Save
+  out_path <- here::here(params$figures_dir, paste0(file_stub, ".png"))
+  ggsave(out_path, plot = g, width = 12, height = 6, units = "in", dpi = 300)
+  if (isTRUE(params$dev_mode)) message("Saved: ", out_path)
+
+  invisible(g)
+}
+
+# ---- Build and save BOTH manuscript figures ----
+plots <- predictors_fig08_09 %>%
+  mutate(
+    plot = pmap(
+      list(predictor_var, predictor_label, file_stub),
+      ~make_timeseries_logistic_figure(
+        df_mop_all = df_mop_all,
+        predictor_var = ..1,
+        predictor_label = ..2,
+        file_stub = ..3
+      )
+    )
+  )
+
+# Print them into the knitted output (order matches tribble rows)
+plots$plot[[1]]
+plots$plot[[2]]
+```
+
+edit Sept 26, 2026
+# TWL Time Series with Logistic sigmoid curve (Options A and B)
+```{r}
+# Option A ("full"):   left panel shows the full record; right panel shows all days.
+# Option B ("window"): left panel zoomed to params$time_xlim_*; right panel points
+#                      restricted to the same window.
+# In BOTH options the logistic fit and 0.5 threshold use the FULL record.
+mop_id <- "D0044"
+
+predictors_fig08_09 <- tribble(
+  ~predictor_var,      ~predictor_label,        ~file_stub,
+  hp,                   hp_label,                "f09",
+  "twl",                "TWL (m)",              "f08"
+)
+
+view_options <- tribble(
+  ~view,     ~suffix,       ~fig_width,
+  "full",    "_A_full",     14,
+  "window",  "_B_window",   12
+)
+
+df_ib <- df_photos_max %>%
+  filter(mop >= params$ib_mop_min, mop <= params$ib_mop_max) %>%
+  mutate(date = as.Date(date))
+
+df_mop_all <- df_ib %>% filter(mop == mop_id)
+stopifnot(nrow(df_mop_all) > 0)
+
+# Shared y-limits across both predictors AND both views (full record)
+y_max_pad <- 0.5
+y_min <- suppressWarnings(min(c(df_mop_all[[hp]], df_mop_all$twl), na.rm = TRUE))
+y_max <- suppressWarnings(max(c(df_mop_all[[hp]], df_mop_all$twl), na.rm = TRUE))
+if (!is.finite(y_min) || !is.finite(y_max)) {
+  stop("Could not compute shared y-limits for ", mop_id, ".")
+}
+y_limits <- c(y_min, y_max + y_max_pad)
+
+win <- as.Date(c(params$time_xlim_start, params$time_xlim_end))
+
+make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor_label,
+                                            file_stub, view = c("full", "window"),
+                                            suffix = "", fig_width = 12) {
+  view <- match.arg(view)
+
+  df_mop <- df_mop_all %>% filter(!is.na(.data[[predictor_var]]))
+  stopifnot(nrow(df_mop) > 0)
+
+  # ---- Fit on the FULL record (unchanged across views) ----
+  fit <- fit_logit_threshold(df_mop, predictor_var)
+  mod <- fit$model
+  thr <- fit$threshold
+
+  twl_seq <- seq(
+    min(df_mop[[predictor_var]], na.rm = TRUE),
+    max(df_mop[[predictor_var]], na.rm = TRUE) + 1,
+    length.out = 200
+  )
+  newdata <- tibble(!!predictor_var := twl_seq)
+  logistic_curve <- tibble(
+    twl  = twl_seq,
+    prob = predict(mod, newdata = newdata, type = "response")
+  )
+
+  # ---- Data actually DISPLAYED (differs by view) ----
+  # Option A drops 2010 from the DISPLAY only; the fit above still uses it.
+  if (view == "window") {
+    df_plot     <- df_mop %>% filter(date >= win[1], date <= win[2])
+    x_lims      <- win
+    date_breaks <- "6 months"
+    date_labels <- "%b %Y"
+  } else {
+    df_plot     <- df_mop %>% filter(lubridate::year(date) != 2010)
+    x_lims      <- range(df_plot$date, na.rm = TRUE)
+    date_breaks <- "1 year"
+    date_labels <- "%Y"
+  }
+  stopifnot(nrow(df_plot) > 0)
+
+  message(sprintf("%s | %s | impacts displayed: %d of %d in full record",
+                  predictor_var, view,
+                  sum(df_plot$photo == 1), sum(df_mop$photo == 1)))
+
+  # ---- Legend setup ----
+  legend_levels <- c("Evidence of impact", predictor_label,
+                     "0.5 probability threshold", "Logistic sigmoid curve")
+  color_values    <- setNames(c("red", "grey40", "forestgreen", "blue"), legend_levels)
+  linetype_values <- setNames(c("blank", "solid", "dashed", "dashed"), legend_levels)
+  shape_values    <- setNames(c(1, NA, NA, NA), legend_levels)
+
+  # ---- Left panel ----
+  p_left <- ggplot(df_plot, aes(x = date)) +
+    geom_line(
+      aes(y = .data[[predictor_var]], color = predictor_label, linetype = predictor_label),
+      linewidth = 0.7
+    ) +
+    geom_point(
+      data = df_plot %>% filter(photo == 1),
+      aes(y = .data[[predictor_var]], color = "Evidence of impact",
+          shape = "Evidence of impact", linetype = "Evidence of impact"),
+      size = 2.6, stroke = 1
+    ) +
+    geom_line(
+      data = logistic_curve,
+      aes(x = x_lims[1], y = twl, color = "Logistic sigmoid curve",
+          linetype = "Logistic sigmoid curve"),
+      linewidth = 0.7, alpha = 0
+    ) +
+    geom_hline(
+      aes(yintercept = thr, color = "0.5 probability threshold",
+          linetype = "0.5 probability threshold"),
+      linewidth = 0.7, alpha = 0
+    ) +
+    scale_x_date(limits = x_lims, date_labels = date_labels,
+                 date_breaks = date_breaks, expand = c(0, 0)) +
+    scale_y_continuous(limits = y_limits, expand = c(0, 0)) +
+    labs(x = NULL, y = predictor_label, color = NULL, linetype = NULL, shape = NULL) +
+    scale_color_manual(values = color_values, breaks = legend_levels, drop = FALSE) +
+    scale_linetype_manual(values = linetype_values, breaks = legend_levels, drop = FALSE) +
+    scale_shape_manual(values = shape_values, breaks = legend_levels, drop = FALSE) +
+    guides(
+      color = guide_legend(
+        ncol = 1,
+        override.aes = list(
+          shape     = c(1, NA, NA, NA),
+          linetype  = c("blank", "solid", "dashed", "dashed"),
+          linewidth = c(0, 0.8, 0.8, 0.8),
+          alpha     = rep(1, length(legend_levels))
+        )
+      ),
+      linetype = "none", shape = "none"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 11, color = "black"),
+      axis.title.y = element_text(size = 12, margin = margin(r = 10)),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      panel.grid = element_blank(),
+      legend.position = c(0.5, 0.95),
+      legend.justification = c(0.5, 1),
+      legend.background = element_rect(fill = scales::alpha("white", 0.75), color = NA),
+      legend.key = element_rect(fill = NA, color = NA),
+      legend.text = element_text(size = 10)
+    )
+
+  # ---- Right panel: points from df_plot, curve/threshold from full-record fit ----
+  p_right <- ggplot() +
+    geom_point(
+      data = df_plot %>% filter(photo == 0),
+      aes(x = 0, y = .data[[predictor_var]]),
+      shape = 1, size = 2.6, stroke = 1, color = "grey60"
+    ) +
+    geom_point(
+      data = df_plot %>% filter(photo == 1),
+      aes(x = 1, y = .data[[predictor_var]]),
+      shape = 1, size = 2.6, stroke = 1, color = "red"
+    ) +
+    geom_line(
+      data = logistic_curve, aes(x = prob, y = twl),
+      linetype = "dashed", linewidth = 0.7, color = "blue"
+    ) +
+    geom_hline(yintercept = thr, linetype = "dashed", linewidth = 0.7, color = "forestgreen") +
+    scale_x_continuous(breaks = c(0, 1), labels = c("No evidence\nof impact", "Evidence\nof impact"),
+                       limits = c(-0.5, 1.5)) +
+    scale_y_continuous(limits = y_limits, expand = c(0, 0)) +
+    labs(x = NULL, y = predictor_label) +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 11, color = "black"),
+      axis.title.y = element_text(size = 12, margin = margin(r = 10)),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      panel.grid = element_blank(),
+      legend.position = "none"
+    )
+
+  g <- gridExtra::arrangeGrob(p_left, p_right, ncol = 2, widths = c(2.5, 0.9))
+
+  out_path <- here::here(params$figures_dir, paste0(file_stub, suffix, ".png"))
+  ggsave(out_path, plot = g, width = fig_width, height = 6, units = "in", dpi = 300)
+  if (isTRUE(params$dev_mode)) message("Saved: ", out_path)
+
+  g
+}
+
+# ---- Build all four figures (2 predictors x 2 views) ----
+plots <- tidyr::crossing(predictors_fig08_09, view_options) %>%
+  mutate(
+    plot = pmap(
+      list(predictor_var, predictor_label, file_stub, view, suffix, fig_width),
+      ~make_timeseries_logistic_figure(
+        df_mop_all      = df_mop_all,
+        predictor_var   = ..1,
+        predictor_label = ..2,
+        file_stub       = ..3,
+        view            = ..4,
+        suffix          = ..5,
+        fig_width       = ..6
+      )
+    )
+  )
+
+# Print into the knitted output
+for (i in seq_len(nrow(plots))) {
+  grid::grid.newpage()
+  grid::grid.draw(plots$plot[[i]])
+}
+```
+
+
+
+### Logistic threshold for all MOPs and predictors
+```{r}
+predictors <- c("twl", "runup", "twl_daytime", "runup_daytime", "twl_max", "twl_max_daytime")
+
+results <- map_dfr(sort(unique(df_photos_max$mop)), function(mop_id) {
+  df_m <- df_photos_max %>% filter(mop == mop_id)
+
+  total_photos <- sum(df_m$photo == 1, na.rm = TRUE)
+  # Need both outcome classes
+  if (nrow(df_m) < 10 || n_distinct(df_m$photo) < 2) {
+    return(tibble())
+  }
+
+  map_dfr(predictors, function(p) {
+    # Require predictor to exist and not be all NA
+    if (!(p %in% names(df_m)) || all(is.na(df_m[[p]]))) {
+      return(tibble())
+    }
+
+    df_mm <- df_m %>% filter(!is.na(.data[[p]]), !is.na(photo))
+
+    if (nrow(df_mm) < 10 || n_distinct(df_mm$photo) < 2) {
+      return(tibble())
+    }
+
+    fit <- tryCatch(fit_logit_threshold(df_mm, p), error = function(e) NULL)
+    if (is.null(fit)) return(tibble())
+
+    mod <- fit$model
+    thr <- fit$threshold
+
+    # Extract inference
+    td <- broom::tidy(mod)
+    pval <- td %>% filter(term == p) %>% pull(p.value)
+    coef_value <- td %>% filter(term == p) %>% pull(estimate)
+
+    se_thr <- threshold_se_delta(mod)
+
+    if (is.na(thr) || is.na(se_thr)) {
+      lb <- NA_real_
+      ub <- NA_real_
+    } else {
+      lb <- thr - 1.96 * se_thr
+      ub <- thr + 1.96 * se_thr
+    }
+
+    tibble(
+      mop = mop_id,
+      predictor = p,
+      total_photos = total_photos,
+      threshold = thr,
+      threshold_se = se_thr,
+      lower_95 = lb,
+      upper_95 = ub,
+      coefficient = coef_value,
+      slope = fit$slope,
+      fit_flag = fit$flag,
+      n_events  = fit$n_events,
+      converged = fit$converged,
+      separated = fit$separated,
+      p_value = pval,
+      AIC = AIC(mod)
+    )
+  })
+})
+
+results_clean <- results %>%
+  mutate(
+    mop_num = mop_to_num(mop),
+    significance = if_else(!is.na(p_value) & p_value < 0.05, "Significant", "Not significant")
+  ) %>%
+  arrange(predictor, mop_num) %>%
+  mutate(across(c(threshold, threshold_se, lower_95, upper_95, coefficient, AIC), ~round(.x, 3)),
+         p_value = round(p_value, 6))
+
+results_clean <- results_clean %>% mutate(in_main = mop %in% mops_main)
+results_main  <- results_clean %>% filter(in_main)
+
+stopifnot(all(results_main$n_events >= min_events),
+          !any(results_main$mop %in% exclude_mops_default))
+
+write_csv(results_main,
+  here::here(params$tables_dir, "logistic_thresholds_by_mop_predictor.csv"))
+write_csv(results_clean,
+  here::here(params$tables_dir, "logistic_thresholds_by_mop_predictor_all_transects.csv"))
+
+results_main %>% count(predictor, fit_flag)
+```
+
+# Cross-predictor comparison (reviewer comments 4, 5, 7d).
+```{r}
+# One row per predictor, aggregated over transects with >= 2 photos.
+predictor_comparison <- results_main %>%
+  dplyr::filter(fit_flag == "ok") %>%
+  dplyr::mutate(ci_half_width = 1.96 * threshold_se) %>%
+  dplyr::group_by(predictor) %>%
+  dplyr::summarise(
+    n_transects      = dplyr::n(),
+    median_threshold = median(threshold, na.rm = TRUE),
+    iqr_threshold    = IQR(threshold, na.rm = TRUE),
+    median_ci_half   = median(ci_half_width, na.rm = TRUE),  # uncertainty metric
+    median_AIC       = median(AIC, na.rm = TRUE),
+    pct_significant  = 100 * mean(p_value < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~round(.x, 3))) %>%
+  dplyr::arrange(median_ci_half)  # tightest uncertainty first
+
+predictor_comparison
+readr::write_csv(predictor_comparison,
+  here::here(params$tables_dir, "predictor_comparison_summary.csv"))
+```
+
+# Fair AIC comparison: refit all six predictors on the SAME rows per
+```{r}
+# transect (complete cases across all six), then compare to the baseline.
+preds    <- c("twl","runup","twl_daytime","runup_daytime","twl_max","twl_max_daytime")
+baseline <- hp
+
+delta_aic <- purrr::map_dfr(sort(unique(df_photos_max$mop)), function(mid) {
+  d <- df_photos_max %>%
+    dplyr::filter(mop == mid) %>%
+    tidyr::drop_na(dplyr::all_of(c("photo", preds)))
+  if (nrow(d) < 10 || dplyr::n_distinct(d$photo) < 2) return(tibble::tibble())
+  aics <- vapply(preds, function(p) {
+    m <- tryCatch(glm(reformulate(p, "photo"), binomial, d), error = function(e) NULL)
+    if (is.null(m)) NA_real_ else AIC(m)
+  }, numeric(1))
+  tibble::tibble(mop = mid, predictor = preds, dAIC = aics - aics[[baseline]])
+})
+
+deltaAIC_summary <- delta_aic %>%
+  dplyr::group_by(predictor) %>%
+  dplyr::summarise(
+    n_transects = dplyr::n(),
+    median_dAIC = median(dAIC, na.rm = TRUE),   # >0 = worse than baseline
+    n_better    = sum(dAIC < -2, na.rm = TRUE), # clearly better (dAIC < -2)
+    n_worse     = sum(dAIC >  2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% dplyr::arrange(median_dAIC)
+
+deltaAIC_summary
+```
+
+```{r}
+summarise_predictors <- function(res, daic, sample_label) {
+  thr <- res %>%
+    filter(fit_flag == "ok") %>%
+    group_by(predictor) %>%
+    summarise(n_thresholds     = n(),
+              median_threshold = median(threshold),
+              iqr_threshold    = IQR(threshold),
+              median_ci_half   = median(1.96 * threshold_se, na.rm = TRUE),
+              .groups = "drop")
+
+  cmp <- daic %>%
+    filter(!is.na(dAIC)) %>%
+    group_by(predictor) %>%
+    summarise(n_transects = n(),
+              median_dAIC = median(dAIC),
+              n_worse_any = sum(dAIC > 0),
+              n_better_2  = sum(dAIC < -2),
+              n_worse_2   = sum(dAIC > 2),
+              .groups = "drop") %>%
+    mutate(p_sign = purrr::map2_dbl(n_worse_any, n_transects,
+                                    ~ binom.test(.x, .y)$p.value),
+           p_sign = if_else(predictor == baseline, NA_real_, p_sign))
+
+  left_join(cmp, thr, by = "predictor") %>%
+    mutate(sample = sample_label, .before = 1)
+}
+
+table_sx <- bind_rows(
+  summarise_predictors(results_main,
+                       filter(delta_aic, mop %in% mops_main),
+                       "Main: >=2 flood photos"),
+  summarise_predictors(filter(results_clean, !mop %in% exclude_mops_default),
+                       filter(delta_aic, !mop %in% exclude_mops_default),
+                       "Sensitivity: all transects (>=1 flood photo)")
+) %>%
+  arrange(factor(sample, levels = unique(sample)), match(predictor, preds_all)) %>%
+  mutate(across(where(is.double), ~ signif(.x, 3)))
+
+table_sx
+readr::write_csv(table_sx, here::here(params$tables_dir, "table_SX_photo_threshold_sensitivity.csv"))
+```
+
+
+### Threshold CI plot
+```{r}
+# -----------------------------
+# Settings (manuscript figure)
+# -----------------------------
+pname  <- hp
+y_lims <- c(0, 7)
+
+# Display name (optional; used for axis label)
+predictor_display <- c(
+  twl = "TWL (m)",
+  runup = "Runup (m)",
+  twl_daytime = "TWL-daytime (m)",
+  runup_daytime = "Runup-daytime (m)",
+  twl_max = "TWL-max (m)",
+  twl_max_daytime = "TWL-max-daytime (m)"
+)
+
+
+# -----------------------------
+# Build plotting dataset from results_clean
+# -----------------------------
+df_one <- results_main %>%
+  filter(
+    predictor == pname,
+    fit_flag == "ok"
+  ) %>%
+  mutate(
+    region     = mop_region(mop),
+    region_col = region_colors[region],
+    photo_cat  = photo_bin(n_events)
+  ) %>%
+  arrange(mop_num) %>%
+  mutate(
+    mop = factor(mop, levels = unique(mop)),
+    mop_label = paste0("<span style='color:", region_col, "'>", mop, "</span>")
+  )
+
+stopifnot(nrow(df_one) > 0)
+
+# Region label positions (centered under each region's set of MOPs)
+label_positions <- df_one %>%
+  filter(region %in% c("Imperial Beach", "La Jolla", "Cardiff State Beach")) %>%
+  group_by(region) %>%
+  summarize(x_pos = mean(as.numeric(mop)), .groups = "drop")
+
+# Slightly above bottom axis (within y limits)
+y_offset <- y_lims[1] + 0.05 * diff(y_lims)
+
+# -----------------------------
+# Plot
+# -----------------------------
+p_ci <- ggplot(df_one, aes(x = mop, y = threshold, color = photo_cat)) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = lower_95, ymax = upper_95), width = 0.2) +
+  scale_color_manual(
+    values = photo_colors,
+    breaks = names(photo_colors),
+    drop   = FALSE
+  ) +
+  scale_x_discrete(labels = setNames(gsub("<[^>]+>", "", df_one$mop_label), df_one$mop)) +
+  scale_y_continuous(
+    limits = y_lims,
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "MOP transect",
+    y = paste0("Threshold for ", predictor_display[[pname]], " (P = 0.5)"),
+    color = "Total photos"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x  = element_text(angle = 90, hjust = 0.5, vjust = 0.5, size = 10),
+    axis.text.y  = element_text(size = 10),
+    axis.title.x = element_text(size = 12, margin = margin(t = 10)),
+    axis.title.y = element_text(size = 12, margin = margin(r = 10)),
+    legend.title = element_text(size = 11),
+    legend.text  = element_text(size = 10),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    panel.grid   = element_blank()
+  ) +
+  annotate(
+    "text",
+    x = label_positions$x_pos[label_positions$region == "Imperial Beach"],
+    y = y_offset,
+    label = "Imperial Beach",
+    color = region_colors["Imperial Beach"],
+    size = 4.5
+  ) +
+  annotate(
+    "text",
+    x = label_positions$x_pos[label_positions$region == "La Jolla"],
+    y = y_offset,
+    label = "La Jolla",
+    color = region_colors["La Jolla"],
+    size = 4.5
+  ) +
+  annotate(
+    "text",
+    x = label_positions$x_pos[label_positions$region == "Cardiff State Beach"],
+    y = y_offset,
+    label = "Cardiff State Beach",
+    color = region_colors["Cardiff State Beach"],
+    size = 4.5,
+    hjust = 0.7
+  )
+
+p_ci <- p_ci +
+  theme(
+    panel.grid.major = element_line(linewidth = 0.3, color = "grey85"),
+    panel.grid.minor = element_blank()  # or element_line(linewidth = 0.2, color="grey92")
+  )
+p_ci
+save_gg(p_ci, "f10.png", width = 10, height = 6)
+```
+
+# 30 Sept 2026: Fieller function and comparison table
+```{r}
+# ============================================================
+# Fieller vs delta-method 95% intervals for the P = 0.5 threshold
+# Predictor: TWL-max-daytime (same as Figure 9)
+# ============================================================
+
+# Fieller interval for theta = -b0/b1 from a fitted binomial GLM.
+# Invert the Wald test of H0: b0 + theta*b1 = 0, i.e. solve
+#   A*theta^2 + 2*B*theta + C <= 0
+# where A = b1^2 - z^2*V11, B = b0*b1 - z^2*V01, C = b0^2 - z^2*V00.
+# A > 0 is equivalent to the slope being significant at the chosen level;
+# only then is the Fieller set a bounded interval.
+fieller_threshold_ci <- function(model, level = 0.95) {
+  b  <- coef(model)
+  V  <- suppressWarnings(vcov(model))
+  z2 <- qnorm(1 - (1 - level) / 2)^2
+
+  na_out <- tibble(lower = NA_real_, upper = NA_real_,
+                   bounded = NA, fieller_type = NA_character_)
+  if (length(b) < 2 || any(!is.finite(b[1:2])) ||
+      any(!is.finite(V[1:2, 1:2]))) return(na_out)
+
+  b0 <- unname(b[1]); b1 <- unname(b[2])
+  A  <- b1^2 - z2 * V[2, 2]
+  B  <- b0 * b1 - z2 * V[1, 2]
+  C  <- b0^2 - z2 * V[1, 1]
+  disc <- B^2 - A * C
+
+  if (A > 0 && disc >= 0) {
+    tibble(lower = (-B - sqrt(disc)) / A,
+           upper = (-B + sqrt(disc)) / A,
+           bounded = TRUE, fieller_type = "bounded")
+  } else {
+    # Slope not distinguishable from zero: the confidence set is unbounded
+    tibble(lower = -Inf, upper = Inf,
+           bounded = FALSE, fieller_type = "unbounded")
+  }
+}
+
+pname <- hp
+include_single_photo <- FALSE   # TRUE adds 1-photo transects (reviewer L229 sensitivity)
+
+delta_tbl <- results_clean %>%
+  filter(predictor == pname, fit_flag == "ok",
+         !mop %in% exclude_mops_default)
+if (!include_single_photo) delta_tbl <- delta_tbl %>% filter(mop %in% mops_main)
+
+delta_tbl <- delta_tbl %>%
+  select(mop, n_events, total_photos, threshold, threshold_se,
+         lower_95, upper_95, p_value)
+
+# Refit each transect with the same rows used in the main loop
+fieller_tbl <- purrr::map_dfr(delta_tbl$mop, function(mid) {
+  d   <- df_photos_max %>%
+    filter(mop == mid, !is.na(.data[[pname]]), !is.na(photo))
+  fit <- fit_logit_threshold(d, pname)
+  fieller_threshold_ci(fit$model) %>%
+    mutate(mop = mid, threshold_refit = fit$threshold)
+}) %>%
+  rename(lower_fieller = lower, upper_fieller = upper)
+
+cmp <- delta_tbl %>%
+  left_join(fieller_tbl, by = "mop") %>%
+  mutate(
+    width_delta   = upper_95 - lower_95,
+    width_fieller = upper_fieller - lower_fieller,
+    width_ratio   = width_fieller / width_delta,
+    lower_shift   = lower_fieller - lower_95,
+    upper_shift   = upper_fieller - upper_95,
+    region        = mop_region(mop),
+    photo_cat     = factor(photo_bin(n_events), levels = names(photo_colors))
+  )
+
+# Sanity check: refit reproduces the stored thresholds
+# (results_clean is rounded to 3 decimals, hence the tolerance)
+stopifnot(all(abs(cmp$threshold - cmp$threshold_refit) < 1e-3))
+
+# Summary by photo-count bin
+cmp_summary <- cmp %>%
+  group_by(photo_cat) %>%
+  summarise(
+    n_transects          = n(),
+    n_fieller_unbounded  = sum(!bounded),
+    median_width_delta   = median(width_delta),
+    median_width_fieller = median(width_fieller[bounded]),
+    median_width_ratio   = median(width_ratio[bounded]),
+    median_lower_shift   = median(lower_shift[bounded]),
+    median_upper_shift   = median(upper_shift[bounded]),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+print(cmp_summary)
+print(cmp %>% filter(!bounded) %>% select(mop, n_events, threshold, p_value))
+
+write_csv(cmp %>% mutate(across(where(is.numeric), ~ round(.x, 3))),
+          here::here(params$tables_dir, "threshold_ci_delta_vs_fieller.csv"))
+```
+
+Comparison table
+```{r}
+y_lims   <- c(0, 7)
+y_offset <- y_lims[1] + 0.05 * diff(y_lims)
+
+mop_order <- cmp %>% distinct(mop) %>% arrange(mop_to_num(mop)) %>% pull(mop)
+
+lab_df <- tibble(mop = mop_order) %>%
+  mutate(region = mop_region(mop),
+         col    = region_colors[region],
+         label  = paste0("<span style='color:", col, "'>", mop, "</span>"))
+
+df_long <- bind_rows(
+  cmp %>% transmute(mop, photo_cat, threshold, method = "Delta (Wald)",
+                    lo = lower_95, hi = upper_95),
+  cmp %>% transmute(mop, photo_cat, threshold, method = "Fieller",
+                    lo = lower_fieller, hi = upper_fieller)
+) %>%
+  mutate(
+    mop     = factor(mop, levels = mop_order),
+    lo_plot = pmax(lo, y_lims[1]),
+    hi_plot = pmin(hi, y_lims[2]),
+    lo_clip = lo < y_lims[1],
+    hi_clip = hi > y_lims[2]
+  )
+
+region_lab <- lab_df %>%
+  mutate(x = row_number()) %>%
+  filter(region != "Other") %>%
+  group_by(region) %>%
+  summarise(x = mean(x), .groups = "drop")
+
+dodge <- position_dodge(width = 0.65)
+
+p_cmp <- ggplot(df_long,
+                aes(x = mop, y = threshold, color = photo_cat,
+                    shape = method, linetype = method, group = method)) +
+  geom_errorbar(aes(ymin = lo_plot, ymax = hi_plot),
+                width = 0.35, position = dodge) +
+  geom_point(size = 2, position = dodge) +
+  # triangles mark intervals clipped by the axis limits
+  geom_point(data = filter(df_long, hi_clip), aes(y = hi_plot),
+             shape = 24, size = 1.8, position = dodge, show.legend = FALSE) +
+  geom_point(data = filter(df_long, lo_clip), aes(y = lo_plot),
+             shape = 25, size = 1.8, position = dodge, show.legend = FALSE) +
+  geom_text(data = region_lab, aes(x = x, y = y_offset, label = region),
+            inherit.aes = FALSE, size = 4.5,
+            color = region_colors[region_lab$region]) +
+  scale_color_manual(values = photo_colors, breaks = names(photo_colors),
+                     drop = FALSE) +
+  scale_shape_manual(values = c("Delta (Wald)" = 16, "Fieller" = 15)) +
+  scale_linetype_manual(values = c("Delta (Wald)" = "solid", "Fieller" = "dashed")) +
+  scale_x_discrete(labels = setNames(gsub("<[^>]+>", "", lab_df$label), lab_df$mop)) +
+  scale_y_continuous(limits = y_lims, expand = c(0, 0)) +
+  labs(x = "MOP transect",
+       y = paste0("Threshold for ", hp_name, " (P = 0.5)"),
+       color = "Total photos", shape = "Interval", linetype = "Interval") +
+  theme_minimal() +
+  theme(
+    axis.text.x  = element_text(angle = 90, hjust = 0.5, vjust = 0.5, size = 10),
+    axis.text.y  = element_text(size = 10),
+    axis.title.x = element_text(size = 12, margin = margin(t = 10)),
+    axis.title.y = element_text(size = 12, margin = margin(r = 10)),
+    legend.title = element_text(size = 11),
+    legend.text  = element_text(size = 10),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    panel.grid.major = element_line(linewidth = 0.3, color = "grey85"),
+    panel.grid.minor = element_blank()
+  )
+
+p_cmp
+save_gg(p_cmp, "f_delta_vs_fieller.png", width = 10, height = 6)
+```
+
+Detailed analysis
+```{r}
+results_main %>%
+  filter(predictor == hp) %>%
+  count(fit_flag)
+
+results_clean %>%
+  distinct(mop, total_photos, n_events) %>%
+  filter(total_photos != n_events)
+```
+Following up to see if any of the single photo MOP transects have a flag
+```{r}
+# 1. Flag counts by predictor, all transects in results_clean (D0841 excluded)
+results_clean %>%
+  filter(!mop %in% exclude_mops_default) %>%
+  count(predictor, fit_flag) %>%
+  pivot_wider(names_from = fit_flag, values_from = n, values_fill = 0)
+
+# 2. Every non-ok fit, any predictor
+results_clean %>%
+  filter(fit_flag != "ok") %>%
+  select(mop, predictor, total_photos, n_events, fit_flag, slope, p_value) %>%
+  arrange(predictor, mop)
+
+# 3. TWL-max-daytime only, split by one photo vs two or more
+results_clean %>%
+  filter(predictor == hp, !mop %in% exclude_mops_default) %>%
+  mutate(photo_group = if_else(n_events == 1, "1 photo", "2+ photos")) %>%
+  count(photo_group, fit_flag)
+```
+
+
+
+```{r}
+# ============================
+# Summary stats for f10
+#
+# Output thresholds for TWL and TWL-max and TWL-max-daytime
+# with 95% CI half-width column
+# ============================
+
+predictors_to_output <- unique(c("twl", "twl_max", "twl_max_daytime", hp))
+
+df_thresholds_two <- results_main %>%
+  filter(
+    predictor %in% predictors_to_output
+  ) %>%
+  mutate(
+    ci_half_width = 1.96 * threshold_se  # 95% CI half-width
+  ) %>%
+  select(
+    mop,
+    predictor,
+    total_photos,
+    threshold,
+    threshold_se,
+    ci_half_width,
+    lower_95,
+    upper_95
+  ) %>%
+  arrange(predictor, mop)
+
+print(df_thresholds_two)
+```
+
+Mean threshold +/- SD
+```{r}
+preds <- c("twl", "twl_max", "twl_daytime",
+           "twl_max_daytime", "runup", "runup_daytime")
+
+summarise_thresholds <- function(res) {
+  res %>%
+    filter(predictor %in% preds, fit_flag == "ok") %>%
+    group_by(predictor) %>%
+    summarise(
+      n_transects      = n_distinct(mop),
+      threshold_mean   = mean(threshold),
+      threshold_sd     = sd(threshold),
+      threshold_median = median(threshold),
+      q1               = quantile(threshold, 0.25),
+      q3               = quantile(threshold, 0.75),
+      iqr              = IQR(threshold),
+      .groups = "drop"
+    ) %>%
+    arrange(match(predictor, preds))
+}
+
+summary_main <- summarise_thresholds(results_main)
+summary_main
+```
+# Filter to statistically significant models
+```{r}
+
+alpha <- 0.05
+
+summary_main_sig <- summarise_thresholds(filter(results_main, p_value < alpha))
+summary_main_sig
+```
+
+
+# ============================================================
+# Bayesian Analysis: Transect-specific TWL thresholds (P=0.5)
+# Outcome: photo (0/1)
+# Predictor: TWL-max-daytime (centered at params$twl_threshold_for_summary)
+# ============================================================
+
+
+```{r}
+
+# ---- Convert draws to threshold draws ----
+# If model is: logit(p) = a + b * x_centered
+# then p=0.5 occurs at a + b*x = 0  -> x* = -a/b
+# uncenter: TWL* = center_value + x*
+threshold_draws_from_fit <- function(fit, center_value) {
+  d <- posterior::as_draws_df(fit)
+
+  # brms naming: b_Intercept and b_<predictor>
+  if (!("b_Intercept" %in% names(d))) stop("Could not find b_Intercept in posterior draws.")
+
+  slope_name <- "b_x_centered"
+  if (!(slope_name %in% names(d))) stop("Missing slope draws: ", slope_name)
+  if (length(slope_name) != 1) {
+    stop("Could not uniquely identify slope draws for x_centered.")
+  }
+
+  a <- d[["b_Intercept"]]
+  b <- d[[slope_name]]
+
+  # Guard against division by ~0 slopes
+  eps <- 1e-6
+  thr_centered <- -a / b
+  thr_uncentered <- center_value + thr_centered
+  thr_uncentered[is.finite(thr_uncentered) & abs(b) > eps]
+}
+```
+
+```{r}
+# Use df_photos_max from earlier pipeline
+# Require predictor + outcome
+df_bayes <- df_photos_max %>%
+  filter(!is.na(photo), !is.na(.data[[hp]])) %>%
+  mutate(
+    x_centered = .data[[hp]] - params$twl_threshold_for_summary
+  )
+
+# Photo counts per MOP (flood photos only)
+df_photo_counts <- df_bayes %>%
+  group_by(mop) %>%
+  summarise(
+    n_flood_photos = sum(photo == 1, na.rm = TRUE),
+    n_total_days   = n(),
+    .groups = "drop"
+  )
+
+# Use the same transect sample as the frequentist analysis (defined in Data preparation):
+# >= min_events flood photos on complete-case rows, excluding data-quality drops (e.g., D0841).
+mops_keep <- mops_main
+
+# One-time check: which transects did the old rule select differently?
+mops_keep_old <- df_photo_counts %>%
+  filter(n_flood_photos >= min_events, !mop %in% exclude_mops_default) %>%
+  pull(mop)
+setdiff(mops_keep_old, mops_main)
+setdiff(mops_main, mops_keep_old)
+
+length(mops_keep)
+```
+
+
+```{r}
+# ------------------------------------------------------------
+# Model spec
+# ------------------------------------------------------------
+# Weakly informative priors (WEAKER), interpretable with centering at 3.4 m:
+# - Intercept ~ Normal(0, 2.5): log-odds at TWL=3.4 (broad)
+# - Slope     ~ Normal(0, 2.5): allows positive/negative slopes; less prior push
+priors <- c(
+  prior(normal(0, 2.5), class = "Intercept"),
+  prior(normal(0, 2.5), class = "b")
+)
+
+# ------------------------------------------------------------
+# Compile ONCE using one MOP with adequate data/variability
+# (pick the first MOP that actually has enough rows + both classes)
+# ------------------------------------------------------------
+example_mop <- mops_keep[
+  which(map_lgl(mops_keep, function(m) {
+    dd <- df_bayes %>%
+      filter(mop == m) %>%
+      filter(!is.na(photo), !is.na(x_centered))
+    nrow(dd) >= 10 && n_distinct(dd$photo) >= 2
+  }))[1]
+]
+
+if (is.na(example_mop)) {
+  stop("No MOP in mops_keep has >=10 rows and both photo classes for model compilation.")
+}
+
+example_data <- df_bayes %>%
+  filter(mop == example_mop) %>%
+  filter(!is.na(photo), !is.na(x_centered))
+
+base_fit <- brm(
+  formula = photo ~ x_centered,
+  data    = example_data,
+  family  = bernoulli(link = "logit"),
+  prior   = priors,
+  chains  = 2,
+  iter    = 1000,    # quick compile fit
+  warmup  = 500,
+  seed    = 123,
+  refresh = 0
+)
+
+# ------------------------------------------------------------
+# Loop over transects, reusing compiled Stan program
+# ------------------------------------------------------------
+bayes_results <- tibble(
+  mop              = character(),
+  n_flood_photos   = integer(),
+  threshold_median = double(),
+  threshold_lower  = double(),
+  threshold_upper  = double(),
+  max_rhat         = double(),
+  min_ess_bulk     = double(),
+  min_ess_tail     = double(),
+  n_divergent      = integer()
+)
+
+all_draws_ge2 <- list()
+all_draws_ge8 <- list()
+
+for (m in mops_keep) {
+
+  d_m <- df_bayes %>%
+    filter(mop == m) %>%
+    filter(!is.na(photo), !is.na(x_centered))
+
+  if (nrow(d_m) < 10 || n_distinct(d_m$photo) < 2) next
+
+  fit_m <- update(
+    base_fit,
+    newdata   = d_m,
+    recompile = FALSE,
+    chains    = 4,
+    iter      = 2000,
+    warmup    = 1000,
+    seed      = 123,
+    refresh   = 0,
+    control   = list(adapt_delta = 0.95, max_treedepth = 12)
+  )
+  
+  # --- Convergence diagnostics: substantiate the Methods claim (per-fit) ---
+  diag_tbl <- tryCatch(
+    posterior::summarise_draws(
+      posterior::as_draws_df(fit_m), "rhat", "ess_bulk", "ess_tail"
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(diag_tbl)) {
+    max_rhat <- NA_real_; min_ess_bulk <- NA_real_; min_ess_tail <- NA_real_
+  } else {
+    max_rhat     <- max(diag_tbl$rhat,     na.rm = TRUE)
+    min_ess_bulk <- min(diag_tbl$ess_bulk, na.rm = TRUE)
+    min_ess_tail <- min(diag_tbl$ess_tail, na.rm = TRUE)
+  }
+  n_div <- tryCatch({
+    np <- brms::nuts_params(fit_m)
+    sum(np$Value[np$Parameter == "divergent__"])
+  }, error = function(e) NA_real_)
+
+  thr_draws <- threshold_draws_from_fit(
+    fit_m,
+    center_value = params$twl_threshold_for_summary
+  )
+
+  qs <- quantile(thr_draws, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+
+  n_flood <- df_photo_counts %>%
+    filter(mop == m) %>%
+    pull(n_flood_photos)
+
+  if (length(n_flood) != 1 || is.na(n_flood)) next
+
+  bayes_results <- bayes_results %>%
+    add_row(
+      mop              = m,
+      n_flood_photos   = as.integer(n_flood),
+      threshold_median = as.numeric(qs[[2]]),
+      threshold_lower  = as.numeric(qs[[1]]),
+      threshold_upper  = as.numeric(qs[[3]]),
+      max_rhat         = max_rhat,
+      min_ess_bulk     = min_ess_bulk,
+      min_ess_tail     = min_ess_tail,
+      n_divergent      = as.integer(n_div)
+    )
+
+  if (n_flood >= 2) all_draws_ge2[[m]] <- thr_draws
+  if (n_flood >= 8) all_draws_ge8[[m]] <- thr_draws
+
+  if (isTRUE(params$dev_mode)) message("Bayes processed: ", m, " (n_flood_photos=", n_flood, ")")
+}
+
+bayes_results <- bayes_results %>%
+  mutate(
+    mop_num    = mop_to_num(mop),
+    region     = mop_region(mop),
+    region_col = region_colors[region],
+    photo_cat  = photo_bin(n_flood_photos)
+  ) %>%
+  arrange(mop_num) %>%
+  mutate(
+    mop = factor(mop, levels = unique(mop)),
+    mop_label = paste0("<span style='color:", region_col, "'>", as.character(mop), "</span>")
+  )
+
+bayes_results %>% glimpse()
+
+out_bayes <- here::here(params$tables_dir, "bayes_thresholds_by_mop.csv")
+readr::write_csv(bayes_results, out_bayes)
+if (isTRUE(params$dev_mode)) message("Saved: ", out_bayes)
+```
+```{r bayes-convergence-summary}
+# One-line convergence summary for Methods/Results wording.
+convergence_summary <- bayes_results %>%
+  dplyr::summarise(
+    n_models         = dplyr::n(),
+    max_rhat_overall = max(max_rhat, na.rm = TRUE),
+    min_ess_bulk     = min(min_ess_bulk, na.rm = TRUE),
+    min_ess_tail     = min(min_ess_tail, na.rm = TRUE),
+    total_divergent  = sum(n_divergent, na.rm = TRUE),
+    n_rhat_gt_1_01   = sum(max_rhat > 1.01, na.rm = TRUE)
+  )
+print(convergence_summary)
+```
+
+
+```{r}
+# ============================================================
+# Figure 11: Bayesian thresholds (median + 95% credible interval)
+# Colored by flood-photo count bins; x tick labels colored by region.
+# Shows truncated intervals WITHIN plot bounds + arrows when clipped.
+# ============================================================
+
+# Optional exclusions (match your earlier choices if needed)
+df_f11 <- bayes_results %>%
+  filter(!mop %in% exclude_mops_default)
+
+# y-limits for the figure (tune if you want)
+y_lims <- c(0, 7)
+y_offset <- y_lims[1] + 0.05 * diff(y_lims)
+
+# ---- Truncate CI to plotting window + flags for clipping ----
+df_f11 <- df_f11 %>%
+  mutate(
+    lower_plot = pmax(threshold_lower, y_lims[1]),
+    upper_plot = pmin(threshold_upper, y_lims[2]),
+    lower_trunc = threshold_lower < y_lims[1],
+    upper_trunc = threshold_upper > y_lims[2]
+  )
+
+# Region label positions (centered under each region's MOP group)
+label_positions <- df_f11 %>%
+  filter(region %in% c("Imperial Beach", "La Jolla", "Cardiff State Beach")) %>%
+  group_by(region) %>%
+  summarize(x_pos = mean(as.numeric(mop)), .groups = "drop")
+
+# Arrow size and small offset (in data units) so arrows are visible
+arrow_len <- unit(0.15, "cm")
+cap <- 0.35  # how far arrow points extend into the plot
+
+p_f11 <- ggplot(df_f11, aes(x = mop, y = threshold_median, color = photo_cat)) +
+  geom_point(size = 2) +
+
+  # Draw truncated error bars (always within y_lims)
+  geom_errorbar(aes(ymin = lower_plot, ymax = upper_plot), width = 0.2) +
+
+  # Add bottom arrows where lower bound is below plot
+  geom_segment(
+    data = df_f11 %>% filter(lower_trunc),
+    aes(x = mop, xend = mop, y = y_lims[1], yend = y_lims[1] + cap),
+    inherit.aes = FALSE,
+    arrow = arrow(length = arrow_len)
+  ) +
+
+  # Add top arrows where upper bound is above plot
+  geom_segment(
+    data = df_f11 %>% filter(upper_trunc),
+    aes(x = mop, xend = mop, y = y_lims[2], yend = y_lims[2] - cap),
+    inherit.aes = FALSE,
+    arrow = arrow(length = arrow_len)
+  ) +
+
+  scale_color_manual(values = photo_colors, breaks = names(photo_colors), drop = FALSE) +
+  scale_x_discrete(labels = setNames(gsub("<[^>]+>", "", df_f11$mop_label), df_f11$mop)) +
+  scale_y_continuous(limits = y_lims, expand = c(0, 0)) +
+  labs(
+    x = "MOP transect",
+    y = paste0(hp_name, " threshold (m) for P(photo)=0.5"),
+    color = "Total photos"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x  = element_text(angle = 90, hjust = 0.5, vjust = 0.5, size = 10),
+    axis.text.y  = element_text(size = 10),
+    axis.title.x = element_text(size = 12, margin = margin(t = 10)),
+    axis.title.y = element_text(size = 12, margin = margin(r = 10)),
+    legend.title = element_text(size = 11),
+    legend.text  = element_text(size = 10),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    panel.grid   = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.3, color = "grey85"),
+    panel.grid.minor = element_blank()
+  ) +
+  annotate(
+    "text",
+    x = label_positions$x_pos[label_positions$region == "Imperial Beach"],
+    y = y_offset,
+    label = "Imperial Beach",
+    color = region_colors["Imperial Beach"],
+    size = 4.5
+  ) +
+  annotate(
+    "text",
+    x = label_positions$x_pos[label_positions$region == "La Jolla"],
+    y = y_offset,
+    label = "La Jolla",
+    color = region_colors["La Jolla"],
+    size = 4.5
+  ) +
+  annotate(
+    "text",
+    x = label_positions$x_pos[label_positions$region == "Cardiff State Beach"],
+    y = y_offset,
+    label = "Cardiff State Beach",
+    color = region_colors["Cardiff State Beach"],
+    size = 4.5,
+    hjust = 0.7
+  )
+
+p_f11
+save_gg(p_f11 + labs(title = NULL), "f11.png", width = 10, height = 6)
+```
+
+```{r}
+# ============================================================
+# Manuscript-ready summary numbers
+# (1) D0038
+# (2) "Countywide" pooled posterior across transects with >=2 flood photos
+# (3) Pooled posterior across transects with >=8 flood photos
+# ============================================================
+
+# ---- (1) D0038 ----
+d0038 <- bayes_results %>%
+  filter(as.character(mop) == "D0038") %>%
+  slice(1)
+
+d0038
+
+# ---- Helper: pooled posterior across transects (equal-weight by transect) ----
+pooled_summary <- function(draws_list) {
+  pooled <- unlist(draws_list, use.names = FALSE)
+  qs <- quantile(pooled, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+  tibble(
+    pooled_median = as.numeric(qs[[2]]),
+    pooled_lower  = as.numeric(qs[[1]]),
+    pooled_upper  = as.numeric(qs[[3]])
+  )
+}
+
+pool_ge2 <- pooled_summary(all_draws_ge2)
+pool_ge8 <- pooled_summary(all_draws_ge8)
+
+pool_ge2
+pool_ge8
+
+# ---- Print manuscript-ready sentences (rounded) ----
+fmt <- function(x) sprintf("%.2f", x)
+
+cat(
+  "Bayesian D0038 threshold: ",
+  fmt(d0038$threshold_median),
+  " m [",
+  fmt(d0038$threshold_lower),
+  ", ",
+  fmt(d0038$threshold_upper),
+  "].\n",
+  sep = ""
+)
+
+# Summary across the main transects (>= 2 flood photos): median and range of
+# the transect-level posterior medians. Stacking draws across transects is not
+# reported for this set because sparsely documented transects dominate it.
+main_summary <- bayes_results %>%
+  summarise(n = n(),
+            median_of_medians = median(threshold_median),
+            min_median = min(threshold_median),
+            max_median = max(threshold_median))
+cat(sprintf(
+  "Transect-level posterior medians (n = %d, >=2 flood photos): median %.2f m, range %.2f to %.2f m.\n",
+  main_summary$n, main_summary$median_of_medians,
+  main_summary$min_median, main_summary$max_median))
+
+cat(
+  "NOT REPORTED - stacked draws, >=2 flood photos: ",
+  fmt(pool_ge2$pooled_median),
+  " m [",
+  fmt(pool_ge2$pooled_lower),
+  ", ",
+  fmt(pool_ge2$pooled_upper),
+  "].\n",
+  sep = ""
+)
+
+cat(
+  "Pooled (>=8 flood photos) threshold: ",
+  fmt(pool_ge8$pooled_median),
+  " m [",
+  fmt(pool_ge8$pooled_lower),
+  ", ",
+  fmt(pool_ge8$pooled_upper),
+  "].\n",
+  sep = ""
+)
+```
+
+
+
+# Density plots
+```{r}
+# -----------------------------
+# Settings for f12 (IB only)
+# -----------------------------
+pname <- hp
+
+# -----------------------------
+# Prep plotting data (IB ONLY)
+# -----------------------------
+df_f12 <- df_photos_max %>%
+  filter(mop >= params$ib_mop_min, mop <= params$ib_mop_max) %>%  # IB filter
+  filter(mop %in% mops_main) %>%                                  # shared sample (>= min_events, exclusions applied)
+  filter(!is.na(photo), !is.na(.data[[pname]]))
+
+stopifnot(nrow(df_f12) > 0)
+
+# Facet labels: drop D00 prefix for compactness
+df_f12 <- df_f12 %>%
+  mutate(
+    mop_short = str_replace(mop, "^D00", ""),
+    mop_num   = as.numeric(gsub("^D", "", mop))
+  ) %>%
+  arrange(mop_num) %>%
+  mutate(mop_short = factor(mop_short, levels = unique(mop_short)))
+
+# -----------------------------
+# Logistic thresholds per MOP
+# -----------------------------
+thr_f12 <- df_f12 %>%
+  group_by(mop, mop_short) %>%
+  summarize(
+    threshold = tryCatch(
+      fit_logit_threshold(cur_data(), pname)$threshold,
+      error = function(e) NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(threshold))
+
+f12_check <- thr_f12 %>%
+  left_join(results_main %>% filter(predictor == pname) %>% select(mop, threshold),
+            by = "mop", suffix = c("_f12", "_f10")) %>%
+  mutate(diff = threshold_f12 - threshold_f10) %>%
+  summarise(max_abs_diff = max(abs(diff), na.rm = TRUE)) %>%
+  pull(max_abs_diff)
+
+tol <- 6e-4  # results_main thresholds are rounded to 3 decimals
+cat(sprintf(
+  "Fig 12 vs Fig 10 thresholds: max abs difference = %.2e (expected 0 or < %.0e) -> %s\n",
+  f12_check, tol, if (f12_check < tol) "PASS" else "CHECK: figures fit on different rows"
+))
+
+# -----------------------------
+# Plot
+# -----------------------------
+p_f12 <- ggplot(df_f12, aes(x = .data[[pname]], fill = factor(photo))) +
+  geom_density(alpha = 0.5, position = "identity") +
+  scale_fill_manual(
+    values = c("0" = "blue", "1" = "red"),
+    name = "Photo",
+    labels = c("0" = "No Photo", "1" = "Photo")
+  ) +
+  facet_wrap(~ mop_short, ncol = 1, strip.position = "left") +
+  geom_vline(
+    data = thr_f12,
+    aes(xintercept = threshold),
+    color = "black",
+    linetype = "dashed",
+    linewidth = 0.6,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    x = hp_label,
+    y = "Density",
+    title = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(0.08, "lines"),
+    strip.text.y  = element_text(size = 10),
+    axis.text.y   = element_blank(),
+    axis.ticks.y  = element_blank(),
+    axis.text.x   = element_text(size = 10),
+    axis.title.x  = element_text(size = 12, margin = margin(t = 10)),
+    axis.title.y  = element_text(size = 12, margin = margin(r = 10)),
+    panel.border  = element_rect(color = "black", fill = NA, linewidth = 1),
+    panel.grid    = element_blank()
+  )
+
+p_f12
+
+# -----------------------------
+# Save with height scaled to # IB facets
+# -----------------------------
+n_facets <- n_distinct(df_f12$mop_short)
+h_in <- max(6, 0.55 * n_facets)   # IB-only usually looks good with ~0.55 per facet
+
+save_gg(p_f12, "f12.png", width = 9, height = h_in, dpi = 300)
+```
+
+# Atmospheric River Analysis
+
+```{r}
+# ============================================================
+# Atmospheric River Analysis (Manuscript Figure f13)
+# Question: Is a photo more likely to occur within a window
+#          AFTER an AR made landfall?
+#
+# Operationalization (daily):
+#   AR_after_k = 1 if an AR (ARsr=1) occurred on the same day
+#               OR within the previous k days (lookback window).
+#   Interpretation: on a photo day, was there an AR within the last k days (inclusive)?
+#   This is equivalent to: "photo day falls within k days after an AR day."
+#
+# Model (one per k): photo ~ AR_after_k + (1 | mop)
+# Output: f13.png
+# ============================================================
+```
+
+
+
+```{r f13-ar-after-window, eval=has_ar}
+
+# -----------------------------
+# Read AR catalog + define ARsr
+# -----------------------------
+ar_path <- here::here(params$data_dir, params$ar_catalog_xlsx)
+assert_file_exists(ar_path)
+
+ar <- readxl::read_excel(ar_path, sheet = params$ar_catalog_sheet) %>%
+  mutate(
+    Date = as.Date(Date),
+    ARsr = ifelse(!is.na(StormRank) & StormRank > 0, 1L, 0L)
+  ) %>%
+  select(Date, ARsr) %>%
+  group_by(Date) %>%
+  summarise(ARsr = max(ARsr, na.rm = TRUE), .groups = "drop")
+
+# -----------------------------
+# Merge AR onto TWL/photo daily rows
+# -----------------------------
+df_ar <- df_photos_max %>%
+  mutate(date = as.Date(date)) %>%
+  select(mop, date, photo, twl, twl_daytime, twl_max, twl_max_daytime) %>%
+  distinct(mop, date, .keep_all = TRUE) %>%   # safety
+  left_join(ar, by = c("date" = "Date")) %>%
+  mutate(
+    photo = ifelse(is.na(photo), 0L, as.integer(photo)),
+    ARsr  = ifelse(is.na(ARsr),  0L, as.integer(ARsr)),
+    mop   = factor(mop)
+  ) %>%
+  arrange(mop, date)
+
+# -----------------------------
+# Build cumulative post-AR windows:
+# AR_after0 = AR on same day
+# AR_after3 = AR on same day OR within previous 3 days
+# ... up to K days
+# -----------------------------
+K <- params$ar_window_max_lag_days  # e.g., 7
+
+df_ar <- df_ar %>%
+  group_by(mop) %>%
+  arrange(date, .by_group = TRUE) %>%
+  group_modify(~{
+    d <- .x
+    x <- as.integer(d$ARsr)  # ensure plain integer vector
+
+    for (k in 0:K) {
+      # OR across lagged versions 0..k (all length nrow(d), even when nrow(d)==1)
+      any_in_window <- Reduce(
+        `|`,
+        lapply(0:k, function(j) dplyr::lag(x, n = j, default = 0L) == 1L)
+      )
+
+      d[[paste0("AR_after", k)]] <- as.integer(any_in_window)
+    }
+
+    d
+  }) %>%
+  ungroup()
+
+stopifnot(all(paste0("AR_after", 0:K) %in% names(df_ar)))
+stopifnot(all(unlist(df_ar[paste0("AR_after", 0:K)]) %in% c(0L, 1L)))
+
+# -----------------------------
+# Fit GLMM for each window length
+# -----------------------------
+fit_one <- function(k) {
+  pred <- paste0("AR_after", k)
+
+  # If no variation, skip cleanly
+  if (length(unique(df_ar[[pred]])) < 2) {
+    return(tibble(
+      window_days = k, estimate = NA_real_, std_error = NA_real_,
+      odds_ratio = NA_real_, ci_lower = NA_real_, ci_upper = NA_real_,
+      p_value = NA_real_, AIC = NA_real_
+    ))
+  }
+
+  fml  <- as.formula(paste0("photo ~ ", pred, " + (1 | mop)"))
+  mod <- glmer(
+    fml, data = df_ar, family = binomial(link = "logit"),
+    control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+  )
+
+  co <- summary(mod)$coefficients
+  if (!(pred %in% rownames(co))) {
+    return(tibble(
+      window_days = k, estimate = NA_real_, std_error = NA_real_,
+      odds_ratio = NA_real_, ci_lower = NA_real_, ci_upper = NA_real_,
+      p_value = NA_real_, AIC = AIC(mod)
+    ))
+  }
+
+  est <- co[pred, "Estimate"]
+  se  <- co[pred, "Std. Error"]
+
+  tibble(
+    window_days = k,
+    estimate    = est,
+    std_error   = se,
+    odds_ratio  = exp(est),
+    ci_lower    = exp(est - 1.96 * se),
+    ci_upper    = exp(est + 1.96 * se),
+    p_value     = 2 * (1 - pnorm(abs(est / se))),
+    AIC         = AIC(mod)
+  )
+}
+
+ar_glmm_results <- bind_rows(lapply(0:K, fit_one)) %>%
+  mutate(
+    label = factor(
+      window_days,
+      levels = 0:K,
+      labels = c("0 days post-AR", paste0("0–", 1:K, " days post-AR"))
+    )
+  )
+
+# -----------------------------
+# Plot + save (f13)
+# -----------------------------
+p_f13 <- ggplot(ar_glmm_results, aes(x = label, y = odds_ratio)) +
+  geom_col(fill = "#1f77b4") +   # Blue bars
+  geom_errorbar(
+    aes(ymin = ci_lower, ymax = ci_upper),
+    width = 0.2,
+    color = "black"             # Black error bars
+  ) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    color = "red",              # Red reference line
+    linewidth = 0.8
+  ) +
+  labs(
+    x = "Post-AR window (0–k days after AR; inclusive)",
+    y = "Odds ratio for Photo = 1 (GLMM; 95% CI)",
+    title = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1, vjust = 1, size = 11),
+    axis.text.y  = element_text(size = 11),
+    axis.title.x = element_text(size = 12, margin = margin(t = 10)),
+    axis.title.y = element_text(size = 12, margin = margin(r = 10)),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    panel.grid   = element_blank(),
+    panel.grid.major.y = element_line(linewidth = 0.3, color = "grey85")
+  )
+
+p_f13
+save_gg(p_f13, "f13.png", width = 10, height = 6, dpi = 300)
+```
+Linear model
+```{r, eval=has_ar}
+df_twl_lm <- df_ar %>%
+  group_by(mop) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(AR_lag1 = lag(ARsr, 1, default = 0L)) %>%
+  ungroup()
+
+lm_fit <- lm(twl ~ AR_lag1, data = df_twl_lm)
+
+summary(lm_fit)
+
+```
+Linear mixed-effects model
+```{r, eval=has_ar}
+lmm_fit <- lmer(twl ~ AR_lag1 + (1 | mop), data = df_twl_lm)
+summary(lmm_fit)
+```
+Mean TWL on non-AR days ≈ 1.78 m
+Within one dat post-AR, TWL is on average 0.13 meters higher (≈ 13 cm) than on non-AR days.
+Statistical significance: t = 26.67 → extremely large
+Within a one day window post-AR there was a statistically significant but modest increase in TWL (~0.13 m).
+AR incidence explains only a small fraction of TWL variability relative to tides, waves, and surge.
+
+```{r, eval=has_ar}
+photo_days <- df_ar %>%
+  group_by(date) %>%
+  summarize(photo_day = any(photo == 1)) %>%
+  filter(photo_day) %>%
+  pull(date)
+
+ar_days <- df_ar %>%
+  group_by(date) %>%
+  summarize(ar_day = any(ARsr == 1)) %>%
+  filter(ar_day) %>%
+  pull(date)
+
+length(intersect(photo_days, ar_days))
+```
+MOP transect D0038 analysis
+```{r, eval=has_ar}
+df_d0038 <- df_ar %>%
+  filter(mop == "D0038")
+
+# Function to fit model for one window
+fit_window_glm <- function(k) {
+
+  pred <- paste0("AR_after", k)
+  fml  <- as.formula(paste0("photo ~ ", pred))
+
+  mod <- glm(
+    fml,
+    family = binomial(link = "logit"),
+    data   = df_d0038
+  )
+
+  co <- summary(mod)$coefficients
+
+  est <- co[pred, "Estimate"]
+  se  <- co[pred, "Std. Error"]
+  z   <- co[pred, "z value"]
+  p   <- co[pred, "Pr(>|z|)"]
+
+  tibble(
+    window_days = k,
+    estimate    = est,
+    std_error   = se,
+    odds_ratio  = exp(est),
+    ci_lower    = exp(est - 1.96 * se),
+    ci_upper    = exp(est + 1.96 * se),
+    z_value     = z,
+    p_value     = p,
+    AIC         = AIC(mod)
+  )
+}
+
+# run for 0-7 days
+d0038_window_results <- bind_rows(
+  lapply(0:7, fit_window_glm)
+)
+
+d0038_window_results
+
+```
+```{r, eval=has_ar}
+df_d0038 <- df_ar %>% filter(mop == "D0038")
+
+model_after3 <- glm(photo ~ AR_after3, family = binomial, data = df_d0038)
+summary(model_after3)
+
+model_after3 <- glm(photo ~ AR_after3,
+                    family = binomial,
+                    data = df_d0038)
+
+summary(model_after3)
+```
+
+
+# ENSO Analysis
+```{r, eval=has_oni}
+# ============================================================
+# ENSO Analysis (ONI)  -> outputs f14.png, f15.png
+# ============================================================
+
+# -----------------------------
+# Read ONI netCDF (monthly)
+# -----------------------------
+oni_path <- here::here(params$data_dir, params$oni_nc)
+assert_file_exists(oni_path)
+
+nc <- nc_open(oni_path)
+oni_time   <- ncvar_get(nc, "time")
+oni_value  <- ncvar_get(nc, "value")
+time_units <- ncatt_get(nc, "time", "units")$value
+nc_close(nc)
+
+# Helper: convert netCDF time units -> Date vector
+nc_time_to_date <- function(t, units_str) {
+  # Examples we handle:
+  # "days since 1948-1-1 00:00:0.0"
+  # "days since 1950-01-01"
+  # "months since 1950-01-01"
+  units_str <- as.character(units_str)
+
+  if (str_detect(units_str, "^days since")) {
+    origin <- str_trim(str_remove(units_str, "^days since"))
+    origin <- str_extract(origin, "^\\d{4}-?\\d{1,2}-?\\d{1,2}")
+    origin <- as.Date(origin)
+    return(origin + days(t))
+  }
+
+  if (str_detect(units_str, "^months since")) {
+    origin <- str_trim(str_remove(units_str, "^months since"))
+    origin <- str_extract(origin, "^\\d{4}-?\\d{1,2}-?\\d{1,2}")
+    origin <- as.Date(origin)
+    # add months safely
+    return(origin %m+% months(t))
+  }
+
+  stop("Unsupported time units in oni.nc: ", units_str)
+}
+
+oni_dates <- nc_time_to_date(oni_time, time_units)
+
+oni_monthly <- tibble(
+  Time  = as.Date(oni_dates),
+  Value = as.numeric(oni_value)
+) %>%
+  arrange(Time)
+
+# ------------------------------------------------------------
+# NOAA/CPC canonical ONI event definition:
+# El Niño if ONI >= +0.5 for at least 5 consecutive overlapping seasons
+# La Niña if ONI <= -0.5 for at least 5 consecutive overlapping seasons
+# Otherwise Neutral
+# ------------------------------------------------------------
+
+label_enso_noaa_cpc <- function(oni, thr = 0.5, min_run = 5) {
+  n <- length(oni)
+  phase <- rep("Neutral", n)
+
+  el <- !is.na(oni) & oni >=  thr
+  la <- !is.na(oni) & oni <= -thr
+
+  # Find runs of TRUE of length >= min_run
+  mark_runs <- function(flag, label) {
+    r <- rle(flag)
+    ends <- cumsum(r$lengths)
+    starts <- ends - r$lengths + 1
+    ok <- which(r$values & r$lengths >= min_run)
+    if (length(ok) == 0) return(rep(FALSE, n))
+    idx <- unlist(Map(seq, starts[ok], ends[ok]))
+    out <- rep(FALSE, n)
+    out[idx] <- TRUE
+    out
+  }
+
+  el_idx <- mark_runs(el, "El Niño")
+  la_idx <- mark_runs(la, "La Niña")
+
+  phase[el_idx] <- "El Niño"
+  phase[la_idx] <- "La Niña"
+
+  # If something is somehow both (shouldn't happen), prioritize the larger magnitude
+  both <- el_idx & la_idx
+  if (any(both)) {
+    phase[both] <- ifelse(oni[both] >= 0, "El Niño", "La Niña")
+  }
+
+  phase
+}
+
+oni_monthly <- oni_monthly %>%
+  arrange(Time) %>%
+  mutate(
+    enso_phase = label_enso_noaa_cpc(Value, thr = 0.5, min_run = 5),
+    enso_phase = factor(enso_phase, levels = c("El Niño", "La Niña", "Neutral"))
+  )
+
+# -----------------------------
+# Expand monthly ONI -> daily (repeat value/phase each day in month)
+# -----------------------------
+oni_daily <- oni_monthly %>%
+  mutate(
+    Date = map(Time, ~ seq(.x, .x + days(days_in_month(.x) - 1), by = "day"))
+  ) %>%
+  unnest(Date) %>%
+  select(Date, oni = Value, enso_phase)
+
+# -----------------------------
+# Join ENSO onto your TWL daily dataset
+# -----------------------------
+# Backbone TWL (daily, 2000–2023)
+twl_path <- here::here(params$transects_rds)
+assert_file_exists(twl_path)
+
+twl_23 <- readRDS(twl_path) %>%
+  mutate(date = as.Date(date)) %>%
+  distinct(mop, date, .keep_all = TRUE)  # IMPORTANT: one row per mop-date
+
+# Join ONI to TWL backbone
+twl_enso <- twl_23 %>%
+  left_join(oni_daily, by = c("date" = "Date"))
+```
+
+```{r, eval=has_oni}
+photo_overlay <- df_photos_max %>%
+  mutate(date = as.Date(date)) %>%
+  # keep only what you need to overlay onto the 2000–2023 backbone
+  select(
+    mop, date,
+    photo,
+    twl_max, twl_max_daytime,
+    twl_1_day_before, runup_1_day_before,
+    twl_daytime, runup, runup_daytime
+  ) %>%
+  # ensure photo is 0/1 and de-dupe mop-date (keep photo==1 if duplicates)
+  mutate(photo = ifelse(is.na(photo), 0L, as.integer(photo))) %>%
+  group_by(mop, date) %>%
+  arrange(desc(photo)) %>%
+  slice(1) %>%
+  ungroup()
+
+# Join photo overlay onto the backbone-with-ENSO
+twl_enso_photos <- twl_enso %>%
+  left_join(photo_overlay, by = c("mop","date"), suffix = c("", "_photo")) %>%
+  mutate(photo = ifelse(is.na(photo), 0L, as.integer(photo)))
+```
+
+```{r, eval=has_oni}
+# -----------------------------
+# f14: D0044 time series with ENSO stripe (2000–2023)
+# -----------------------------
+df_f14 <- twl_enso_photos %>%
+  filter(mop == "D0044") %>%
+  filter(date >= as.Date("2000-01-01"), date <= as.Date("2023-12-31"))
+
+stopifnot(nrow(df_f14) > 0)
+
+y_lims_f14 <- c(0.5, 4.2)  # keep your manuscript range
+stripe_y0  <- y_lims_f14[2] - 0.20
+stripe_y1  <- y_lims_f14[2]
+
+p_f14 <- ggplot(df_f14) +
+  # ENSO stripe at top
+  geom_segment(
+    aes(x = date, xend = date, y = stripe_y0, yend = stripe_y1, color = enso_phase),
+    linewidth = 1
+  ) +
+  # TWL line
+  geom_line(aes(x = date, y = twl), color = "lightblue", linewidth = 1) +
+  # Photo markers
+  geom_point(
+    data = df_f14 %>% filter(photo == 1),
+    aes(x = date, y = twl),
+    color = "black",
+    size = 2.5,
+    shape = 1,
+    stroke = 1
+  ) +
+  # Year gridlines
+  geom_vline(
+    xintercept = as.numeric(seq(as.Date("2000-01-01"), as.Date("2023-12-31"), by = "1 year")),
+    color = "darkgray",
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  scale_x_date(
+    date_labels = "%Y",
+    date_breaks = "1 year",
+    limits = as.Date(c("2000-01-01", "2023-12-31")),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(limits = y_lims_f14, expand = c(0, 0)) +
+  scale_color_manual(
+    values = c("El Niño" = "red", "La Niña" = "blue", "Neutral" = "gray"),
+    breaks = c("El Niño", "La Niña", "Neutral"),
+    guide = guide_legend(override.aes = list(linewidth = 3))
+  ) +
+  labs(
+    x = NULL,
+    y = "MOP Transect D0044 TWL (m)",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5, size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(margin = margin(r = 10), size = 12),
+    legend.text = element_text(size = 12),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    panel.grid = element_blank()
+  )
+
+p_f14
+save_gg(p_f14, "f14.png", width = 10, height = 6, dpi = 300)
+```
+
+```{r, eval=has_oni}
+# -----------------------------
+# f15: Extreme-event frequency by ENSO phase (selected MOPs)
+# -----------------------------
+selected_mops <- c(
+  "D0038","D0039","D0041","D0042","D0043","D0044","D0045","D0048",
+  "D0055","D0056","D0057","D0111","D0114","D0349","D0350","D0352",
+  "D0353","D0363","D0373","D0374","D0377","D0379","D0386","D0397",
+  "D0495","D0498","D0499","D0501","D0502","D0503","D0504","D0505",
+  "D0513","D0587","D0588","D0590","D0621","D0623","D0666","D0667",
+  "D0674","D0675","D0678","D0681","D0800","D0881","D0894",
+  "D0896","D0906","D1022"
+)
+
+extreme_var <- "twl"   # change to "twl" if you want "twl_max_daytime"
+twl_thr <- params$twl_threshold_for_summary
+
+df_f15 <- twl_enso_photos %>%
+  filter(mop %in% selected_mops) %>%
+  filter(!is.na(.data[[extreme_var]])) %>%
+  mutate(
+    enso_phase = as.character(enso_phase),
+    enso_phase = ifelse(enso_phase %in% c("Neutral", "Excluded"), "Neutral", enso_phase),
+    extreme_event = as.integer(.data[[extreme_var]] > twl_thr)
+  )
+
+stopifnot(nrow(df_f15) > 0)
+
+extreme_event_by_mop_phase <- df_f15 %>%
+  group_by(mop, enso_phase) %>%
+  summarise(frequency_of_extremes = mean(extreme_event, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    enso_phase = factor(enso_phase, levels = c("El Niño", "La Niña", "Neutral")),
+    mop = factor(mop, levels = selected_mops)
+  )
+
+p_f15 <- ggplot(extreme_event_by_mop_phase, aes(x = mop, y = frequency_of_extremes, fill = enso_phase)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(
+    limits = c(0, 0.04),
+    expand = c(0, 0),
+    breaks = seq(0, 0.04, 0.01)
+  ) +
+  labs(
+    x = "MOP Transect",
+    y = paste0("Frequency of Extreme Events (", extreme_var, " > ", twl_thr, " m)"),
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    axis.text.x = element_text(
+      angle = 90,
+      hjust = 0.5,
+      vjust = 0.5,
+      size = 10
+    ),
+    axis.text.y = element_text(size = 10),
+    axis.title.x = element_text(margin = margin(t = 10), size = 12),
+    axis.title.y = element_text(margin = margin(r = 10), size = 12),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    panel.grid = element_blank(),
+    legend.position = c(0.02, 0.98),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5)
+  ) +
+  scale_fill_manual(values = c("El Niño" = "red", "La Niña" = "blue", "Neutral" = "grey"))
+
+p_f15
+save_gg(p_f15, "f15.png", width = 10, height = 6, dpi = 300)
+```
+
+
+Additions as of 19 Sept 2026
+```{r}
+results_clean %>% filter(total_photos == 1) %>% count(predictor, fit_flag)
+delta_aic %>% left_join(distinct(results_clean, mop, total_photos)) %>%
+  count(total_photos == 1)
+```
+
+```{r}
+multi_mops <- results_clean %>%
+  distinct(mop, total_photos) %>%
+  filter(total_photos >= 2, !mop %in% exclude_mops_default) %>%
+  pull(mop)
+
+summarise_daic <- function(d) {
+  d %>% group_by(predictor) %>%
+    summarise(n_transects = n(),
+              median_dAIC = median(dAIC, na.rm = TRUE),
+              n_better = sum(dAIC < -2, na.rm = TRUE),
+              n_worse  = sum(dAIC >  2, na.rm = TRUE),
+              .groups = "drop")
+}
+
+left_join(
+  summarise_daic(delta_aic),
+  summarise_daic(filter(delta_aic, mop %in% multi_mops)),
+  by = "predictor", suffix = c("_all", "_2plus")
+)
+```
+
+```{r}
+one_mops <- results_clean %>% distinct(mop, total_photos) %>%
+  filter(total_photos == 1) %>% pull(mop)
+
+df_photos_max %>%
+  filter(mop %in% one_mops) %>%
+  pivot_longer(all_of(preds), names_to = "predictor", values_to = "x") %>%
+  filter(!is.na(x), !is.na(photo)) %>%
+  group_by(mop, predictor) %>%
+  summarise(separated = max(x[photo == 1]) >= max(x[photo == 0]),
+            .groups = "drop") %>%
+  count(predictor, separated)
+```
+
+```{r}
+delta_aic %>% filter(mop %in% multi_mops, predictor != baseline) %>%
+  group_by(predictor) %>%
+  summarise(n_pos = sum(dAIC > 0), n = n(),
+            p_sign = binom.test(n_pos, n)$p.value)
+```
+
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```
+

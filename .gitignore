@@ -4,3 +4,5 @@ output/
 .Rhistory
 .DS_Store
 renv/library/
+data/*.xlsx
+data/*.nc

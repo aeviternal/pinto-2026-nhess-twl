@@ -68,9 +68,8 @@ one_transect <- function(f, mop_id) {
            runup_1_day_before = shift(runup))]
   d[, `:=`(twl_max         = pmax(twl,         twl_1_day_before, na.rm = TRUE),
            twl_max_daytime = pmax(twl_daytime, twl_1_day_before, na.rm = TRUE))]
-  d <- d[date >= START_DATE]
   d[, mop := mop_id]
-  d
+  d                                                # full record; 02 trims to START_DATE
 }
 
 twl_daily <- rbindlist(Map(one_transect, files, mops))
