@@ -14,11 +14,11 @@ compared with modeled total water level (TWL) at the same transect. For each tra
 with two or more photo days, a logistic regression of photo occurrence on daily TWL gives
 two thresholds:
 
-- the **50% documentation threshold**, the TWL at which a photo is as likely as not on
-  a given day;
-- the **onset threshold**, the TWL at which the fitted probability equals the
-  transect's overall photo frequency, above which a photo is more likely than on an
-  average day.
+- the **documentation threshold**, the TWL at which a photo is as likely as not on
+  a given day (fitted probability 0.5);
+- the **balanced documentation threshold**, the TWL at which the fitted probability
+  equals the transect's overall photo frequency, above which a photo is more likely
+  than on an average day.
 
 ## Pipeline
 
