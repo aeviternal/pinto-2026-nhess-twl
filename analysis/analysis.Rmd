@@ -1816,7 +1816,7 @@ label_positions <- df_f11 %>%
 
 # Arrow size and small offset (in data units) so arrows are visible
 arrow_len <- unit(0.15, "cm")
-cap <- 0.35  # how far arrow points extend into the plot
+cap <- 0.35  # length of the arrow shaft in data units
 
 p_f11 <- ggplot(df_f11, aes(x = mop, y = threshold_median, color = photo_cat)) +
   geom_point(size = 2) +
@@ -1827,7 +1827,7 @@ p_f11 <- ggplot(df_f11, aes(x = mop, y = threshold_median, color = photo_cat)) +
   # Add bottom arrows where lower bound is below plot
   geom_segment(
     data = df_f11 %>% filter(lower_trunc),
-    aes(x = mop, xend = mop, y = y_lims[1], yend = y_lims[1] + cap),
+    aes(x = mop, xend = mop, y = y_lims[1] + cap, yend = y_lims[1]),
     inherit.aes = FALSE,
     arrow = arrow(length = arrow_len)
   ) +
@@ -1835,7 +1835,7 @@ p_f11 <- ggplot(df_f11, aes(x = mop, y = threshold_median, color = photo_cat)) +
   # Add top arrows where upper bound is above plot
   geom_segment(
     data = df_f11 %>% filter(upper_trunc),
-    aes(x = mop, xend = mop, y = y_lims[2], yend = y_lims[2] - cap),
+    aes(x = mop, xend = mop, y = y_lims[2] - cap, yend = y_lims[2]),
     inherit.aes = FALSE,
     arrow = arrow(length = arrow_len)
   ) +
