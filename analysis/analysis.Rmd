@@ -845,7 +845,7 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
       linewidth = 0.7, alpha = 0
     ) +
     geom_hline(
-      aes(yintercept = onset, color = "Balanced documentation threshold", linetype = "Balanced documentation threshold"),
+      aes(yintercept = balanced_thr, color = "Balanced documentation threshold", linetype = "Balanced documentation threshold"),
       linewidth = 0.7, alpha = 0
     ) +
     scale_x_date(limits = x_lims, date_labels = date_labels,
