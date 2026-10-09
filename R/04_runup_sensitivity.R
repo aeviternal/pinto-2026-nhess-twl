@@ -7,6 +7,11 @@
 # thresholds at each of the main transects. It needs only the files the pipeline
 # already uses: no slope data.
 #
+# The two thresholds, both from the per-transect logistic fit photo ~ daily TWL:
+#   documentation threshold            TWL at which the fitted probability of a photo is 0.5
+#   balanced documentation threshold   TWL at which the fitted probability equals the
+#                                      transect's overall photo rate (mean of photo)
+#
 # Untested when written. Run from the repo root, with the source drive mounted,
 # after R/01 and R/02:   Rscript R/04_runup_sensitivity.R
 
@@ -53,9 +58,9 @@ fit_one <- function(mop_id, r, scale) {
   mod <- suppressWarnings(glm(photo ~ x, data = d, family = binomial))
   b   <- unname(coef(mod))
   data.table(mop = mop_id, scale = scale, n_days = nrow(d), n_photos = sum(d$photo),
-             threshold_50 = -b[1] / b[2],
-             onset        = (qlogis(mean(d$photo)) - b[1]) / b[2],
-             slope        = b[2], AIC = AIC(mod))
+             documentation_threshold          = -b[1] / b[2],
+             balanced_documentation_threshold = (qlogis(mean(d$photo)) - b[1]) / b[2],
+             slope                            = b[2], AIC = AIC(mod))
 }
 
 res <- rbindlist(lapply(main, function(m) {
@@ -66,28 +71,34 @@ res <- rbindlist(lapply(main, function(m) {
 }))
 
 # ---- results ---------------------------------------------------------------------
-base <- res[scale == 1, .(mop, base_50 = threshold_50, base_onset = onset, base_AIC = AIC)]
+base <- res[scale == 1, .(mop,
+                          base_documentation = documentation_threshold,
+                          base_balanced      = balanced_documentation_threshold,
+                          base_AIC           = AIC)]
 res  <- merge(res, base, by = "mop")
-res[, `:=`(d_50 = threshold_50 - base_50, d_onset = onset - base_onset, d_AIC = AIC - base_AIC)]
+res[, `:=`(d_documentation = documentation_threshold - base_documentation,
+           d_balanced      = balanced_documentation_threshold - base_balanced,
+           d_AIC           = AIC - base_AIC)]
 
 dir.create(file.path(OUT_DIR, "tables"), showWarnings = FALSE, recursive = TRUE)
 fwrite(res, file.path(OUT_DIR, "tables", "runup_scale_sensitivity.csv"))
 
 options(width = 200)
 cat("\nBy runup scale, across", length(main), "transects (shifts are relative to scale 1.0):\n")
-print(res[, .(median_threshold_50 = round(median(threshold_50), 2),
-              median_shift_50     = round(median(d_50), 2),
-              range_shift_50      = paste(round(min(d_50), 2), "to", round(max(d_50), 2)),
-              median_onset        = round(median(onset), 2),
-              median_shift_onset  = round(median(d_onset), 2),
-              median_dAIC         = round(median(d_AIC), 2)), by = scale])
+print(res[, .(median_documentation_threshold = round(median(documentation_threshold), 2),
+              median_shift_documentation     = round(median(d_documentation), 2),
+              range_shift_documentation      = paste(round(min(d_documentation), 2), "to",
+                                                     round(max(d_documentation), 2)),
+              median_balanced_threshold      = round(median(balanced_documentation_threshold), 2),
+              median_shift_balanced          = round(median(d_balanced), 2),
+              median_dAIC                    = round(median(d_AIC), 2)), by = scale])
 
-cat("\nPer transect, 50 % documentation threshold (m) by runup scale:\n")
-print(dcast(res, mop + n_photos ~ scale, value.var = "threshold_50")[
+cat("\nPer transect, documentation threshold (m) by runup scale:\n")
+print(dcast(res, mop + n_photos ~ scale, value.var = "documentation_threshold")[
   , lapply(.SD, function(v) if (is.numeric(v)) round(v, 2) else v)], nrows = 100)
 
-cat("\nPer transect, onset threshold (m) by runup scale:\n")
-print(dcast(res, mop + n_photos ~ scale, value.var = "onset")[
+cat("\nPer transect, balanced documentation threshold (m) by runup scale:\n")
+print(dcast(res, mop + n_photos ~ scale, value.var = "balanced_documentation_threshold")[
   , lapply(.SD, function(v) if (is.numeric(v)) round(v, 2) else v)], nrows = 100)
 
 # ---- what slope error does a runup factor correspond to? -------------------------
