@@ -46,8 +46,8 @@ listed in `R/check_setup.R`.
 
 ## Data
 
-Link to data in Zenodo: DOI 10.5281/zenodo.18729176
-
+Link to data in Zenodo: [DOI 10.5281/zenodo.18729176
+](https://zenodo.org/records/23254924)
 In `data/`:
 
 - `photo_transect_days.csv` (in the repo): one row per transect-day with at least one
