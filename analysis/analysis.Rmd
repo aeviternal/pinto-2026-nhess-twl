@@ -491,7 +491,7 @@ save_gg(p_year_month,
 
 # TWL Time Series with Logistic sigmoid curve
 ```{r, eval=FALSE}
-# Superseded by the Options A/B chunk below, which also draws the onset threshold.
+# Superseded by the Options A/B chunk below, which also draws the balanced documentation threshold.
 # Figure: One MOP time series + right panel logistic (D0044) using TWO predictors
 mop_id <- "D0044"
 
@@ -780,8 +780,8 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
   fit <- fit_logit_threshold(df_mop, predictor_var)
   mod <- fit$model
   thr <- fit$threshold
-  # Onset threshold: fitted probability equals the overall photo frequency
-  onset <- thr + qlogis(mean(df_mop$photo)) / fit$slope
+  # Balanced documentation threshold: fitted probability equals the overall photo frequency
+  balanced_thr <- thr + qlogis(mean(df_mop$photo)) / fit$slope
 
   twl_seq <- seq(
     min(df_mop[[predictor_var]], na.rm = TRUE),
@@ -815,7 +815,7 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
 
   # ---- Legend setup ----
   legend_levels <- c("Evidence of impact", predictor_label,
-                     "50% documentation threshold", "Onset threshold",
+                     "Documentation threshold", "Balanced documentation threshold",
                      "Logistic sigmoid curve")
   color_values    <- setNames(c("red", "grey40", "forestgreen", "darkorange", "blue"), legend_levels)
   linetype_values <- setNames(c("blank", "solid", "dashed", "longdash", "dashed"), legend_levels)
@@ -840,12 +840,12 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
       linewidth = 0.7, alpha = 0
     ) +
     geom_hline(
-      aes(yintercept = thr, color = "50% documentation threshold",
-          linetype = "50% documentation threshold"),
+      aes(yintercept = thr, color = "Documentation threshold",
+          linetype = "Documentation threshold"),
       linewidth = 0.7, alpha = 0
     ) +
     geom_hline(
-      aes(yintercept = onset, color = "Onset threshold", linetype = "Onset threshold"),
+      aes(yintercept = onset, color = "Balanced documentation threshold", linetype = "Balanced documentation threshold"),
       linewidth = 0.7, alpha = 0
     ) +
     scale_x_date(limits = x_lims, date_labels = date_labels,
@@ -897,7 +897,7 @@ make_timeseries_logistic_figure <- function(df_mop_all, predictor_var, predictor
       linetype = "dashed", linewidth = 0.7, color = "blue"
     ) +
     geom_hline(yintercept = thr, linetype = "dashed", linewidth = 0.7, color = "forestgreen") +
-    geom_hline(yintercept = onset, linetype = "longdash", linewidth = 0.7, color = "darkorange") +
+    geom_hline(yintercept = balanced_thr, linetype = "longdash", linewidth = 0.7, color = "darkorange") +
     scale_x_continuous(breaks = c(0, 1), labels = c("No evidence\nof impact", "Evidence\nof impact"),
                        limits = c(-0.6, 1.6)) +
     scale_y_continuous(limits = y_limits, expand = c(0, 0)) +
@@ -1363,6 +1363,10 @@ lab_df <- tibble(mop = mop_order) %>%
          col    = region_colors[region],
          label  = paste0("<span style='color:", col, "'>", mop, "</span>"))
 
+# Dodge shared by the error bars, points and clipping arrows.
+# Two methods per transect, so each sits at +/- dodge_w / 4 from the transect position.
+dodge_w <- 0.65
+
 df_long <- bind_rows(
   cmp %>% transmute(mop, photo_cat, threshold, method = "Delta (Wald)",
                     lo = lower_95, hi = upper_95),
@@ -1371,10 +1375,14 @@ df_long <- bind_rows(
 ) %>%
   mutate(
     mop     = factor(mop, levels = mop_order),
+    method  = factor(method, levels = c("Delta (Wald)", "Fieller")),
     lo_plot = pmax(lo, y_lims[1]),
     hi_plot = pmin(hi, y_lims[2]),
     lo_clip = lo < y_lims[1],
-    hi_clip = hi > y_lims[2]
+    hi_clip = hi > y_lims[2],
+    # x position after dodging. geom_segment does not dodge xend, so the arrows
+    # are placed by hand to line up with the dodged error bars.
+    x_dodged = as.numeric(mop) + (as.integer(method) - 1.5) * dodge_w / 2
   )
 
 region_lab <- lab_df %>%
@@ -1383,7 +1391,10 @@ region_lab <- lab_df %>%
   group_by(region) %>%
   summarise(x = mean(x), .groups = "drop")
 
-dodge <- position_dodge(width = 0.65)
+dodge <- position_dodge(width = dodge_w)
+
+arrow_len <- unit(0.15, "cm")   # same as f11
+cap       <- 0.35               # arrow shaft length in data units (same as f11)
 
 p_cmp <- ggplot(df_long,
                 aes(x = mop, y = threshold, color = photo_cat,
@@ -1391,11 +1402,22 @@ p_cmp <- ggplot(df_long,
   geom_errorbar(aes(ymin = lo_plot, ymax = hi_plot),
                 width = 0.35, position = dodge) +
   geom_point(size = 2, position = dodge) +
-  # triangles mark intervals clipped by the axis limits
-  geom_point(data = filter(df_long, hi_clip), aes(y = hi_plot),
-             shape = 24, size = 1.8, position = dodge, show.legend = FALSE) +
-  geom_point(data = filter(df_long, lo_clip), aes(y = lo_plot),
-             shape = 25, size = 1.8, position = dodge, show.legend = FALSE) +
+  # Arrows point outward where the interval runs past the top of the axis ...
+  geom_segment(
+    data = filter(df_long, hi_clip),
+    aes(x = x_dodged, xend = x_dodged,
+        y = y_lims[2] - cap, yend = y_lims[2], color = photo_cat),
+    inherit.aes = FALSE, show.legend = FALSE,
+    arrow = arrow(length = arrow_len)
+  ) +
+  # ... or past the bottom of the axis (unbounded Fieller intervals get both)
+  geom_segment(
+    data = filter(df_long, lo_clip),
+    aes(x = x_dodged, xend = x_dodged,
+        y = y_lims[1] + cap, yend = y_lims[1], color = photo_cat),
+    inherit.aes = FALSE, show.legend = FALSE,
+    arrow = arrow(length = arrow_len)
+  ) +
   geom_text(data = region_lab, aes(x = x, y = y_offset, label = region),
             inherit.aes = FALSE, size = 4.5,
             color = region_colors[region_lab$region]) +
@@ -1993,15 +2015,15 @@ thr_f12 <- df_f12 %>%
   ) %>%
   filter(!is.na(threshold))
 
-# Onset threshold per transect (fitted probability = overall photo frequency)
-onset_f12 <- df_f12 %>%
+# Balanced documentation threshold per transect (fitted probability = overall photo frequency)
+balanced_f12 <- df_f12 %>%
   group_by(mop, mop_short) %>%
   group_modify(~ {
     f <- fit_logit_threshold(.x, pname)
-    tibble(onset = f$threshold + qlogis(mean(.x$photo)) / f$slope)
+    tibble(balanced_thr = f$threshold + qlogis(mean(.x$photo)) / f$slope)
   }) %>%
   ungroup() %>%
-  filter(!is.na(onset))
+  filter(!is.na(balanced_thr))
 
 f12_check <- thr_f12 %>%
   left_join(results_main %>% filter(predictor == pname) %>% select(mop, threshold),
@@ -2036,8 +2058,8 @@ p_f12 <- ggplot(df_f12, aes(x = .data[[pname]], fill = factor(photo))) +
     inherit.aes = FALSE
   ) +
   geom_vline(
-    data = onset_f12,
-    aes(xintercept = onset),
+    data = balanced_f12,
+    aes(xintercept = balanced_thr),
     color = "darkorange",
     linetype = "longdash",
     linewidth = 0.6,
@@ -2757,36 +2779,43 @@ results_main %>%
   select(mop, total_photos, n_events, threshold, lower_95, upper_95, slope, p_value) %>%
   print(n = Inf, width = Inf)
 
-# 2. Onset thresholds: the predictor value at which the fitted probability equals
-#    the transect's overall photo frequency (crossing point of the photo and
-#    no-photo distributions; equal class weights). Delta-method interval, taking
-#    the photo frequency as fixed.
-onset_tbl <- purrr::map_dfr(mops_main, function(m) {
+# 2. Balanced documentation thresholds: the predictor value at which the fitted
+#    probability equals the transect's overall photo frequency (crossing point of
+#    the photo and no-photo distributions; equal class weights). Delta-method
+#    interval, taking the photo frequency as fixed. Reported alongside the
+#    documentation threshold (fitted probability = 0.5).
+balanced_tbl <- purrr::map_dfr(mops_main, function(m) {
   d   <- df_photos_max %>% filter(mop == m, !is.na(.data[[hp]]), !is.na(photo))
   mod <- glm(as.formula(paste("photo ~", hp)), data = d, family = binomial)
   b   <- unname(coef(mod)); V <- vcov(mod)
   k   <- qlogis(mean(d$photo))
-  onset <- (k - b[1]) / b[2]
+  balanced_thr <- (k - b[1]) / b[2]
   g   <- c(-1 / b[2], -(k - b[1]) / b[2]^2)
   se  <- sqrt(as.numeric(t(g) %*% V %*% g))
-  thr50 <- -b[1] / b[2]
+  doc_thr <- -b[1] / b[2]
   x1  <- d[[hp]][d$photo == 1]
   tibble(mop = m, n_photos = sum(d$photo), n_days = nrow(d),
          photo_rate = mean(d$photo),
-         threshold_50 = thr50,
-         onset = onset, onset_lower = onset - 1.96 * se, onset_upper = onset + 1.96 * se,
-         photos_above_onset = sum(x1 > onset), photos_above_50 = sum(x1 > thr50))
+         documentation_threshold = doc_thr,
+         balanced_threshold = balanced_thr,
+         balanced_lower = balanced_thr - 1.96 * se,
+         balanced_upper = balanced_thr + 1.96 * se,
+         photos_above_balanced = sum(x1 > balanced_thr),
+         photos_above_documentation = sum(x1 > doc_thr))
 }) %>%
-  mutate(across(c(threshold_50, onset, onset_lower, onset_upper), ~ round(.x, 2)),
+  mutate(across(c(documentation_threshold, balanced_threshold,
+                  balanced_lower, balanced_upper), ~ round(.x, 2)),
          photo_rate = signif(photo_rate, 3))
-print(onset_tbl, n = Inf, width = Inf)
-onset_tbl %>%
-  summarise(median_onset = median(onset), min_onset = min(onset), max_onset = max(onset),
-            median_50 = median(threshold_50),
-            photos = sum(n_photos), above_onset = sum(photos_above_onset),
-            above_50 = sum(photos_above_50)) %>%
+print(balanced_tbl, n = Inf, width = Inf)
+balanced_tbl %>%
+  summarise(median_balanced = median(balanced_threshold),
+            min_balanced = min(balanced_threshold),
+            max_balanced = max(balanced_threshold),
+            median_documentation = median(documentation_threshold),
+            photos = sum(n_photos), above_balanced = sum(photos_above_balanced),
+            above_documentation = sum(photos_above_documentation)) %>%
   print(width = Inf)
-readr::write_csv(onset_tbl, here::here(params$tables_dir, "onset_thresholds_by_mop.csv"))
+readr::write_csv(balanced_tbl, here::here(params$tables_dir, "balanced_thresholds_by_mop.csv"))
 
 # 3. Delta versus Fieller intervals, all columns
 if (exists("cmp")) print(cmp %>% mutate(across(where(is.numeric), ~ round(.x, 3))), n = Inf, width = Inf)
